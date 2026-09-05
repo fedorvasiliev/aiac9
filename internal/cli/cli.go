@@ -16,10 +16,19 @@ import (
 )
 
 // Execute parses os.Args and dispatches to the requested subcommand. Called
-// without arguments, it starts the interactive question/answer console mode.
+// without arguments, it starts the interactive console wizard.
 func Execute() {
 	if len(os.Args) < 2 {
-		if err := interactive.Run(os.Stdin, os.Stdout); err != nil {
+		cfg, err := config.Load()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "config error:", err)
+			os.Exit(1)
+		}
+
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+
+		if err := interactive.Run(ctx, cfg, os.Stdin, os.Stdout); err != nil {
 			fmt.Fprintln(os.Stderr, "interactive error:", err)
 			os.Exit(1)
 		}
