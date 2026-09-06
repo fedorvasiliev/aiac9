@@ -2,9 +2,10 @@ package interactive
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
-	"github.com/fedorvasiliev/aiac9/internal/kimi"
+	"github.com/fedorvasiliev/aiac9/internal/llm"
 	"github.com/fedorvasiliev/aiac9/internal/promptfile"
 )
 
@@ -17,7 +18,7 @@ import (
 //     message (the plain, template-less case).
 //   - a template's "Words limit" is turned into a sentence appended to every
 //     user-prompt message, same as extra.
-func assembleRequest(tmpl *promptfile.Prompt, fallbackModel, extra string) (messages []kimi.Message, model string, opts kimi.Options) {
+func assembleRequest(tmpl *promptfile.Prompt, fallbackModel, extra string) (messages []llm.Message, model string, opts llm.Options) {
 	model = fallbackModel
 
 	var systemPrompts, userPrompts []string
@@ -29,6 +30,11 @@ func assembleRequest(tmpl *promptfile.Prompt, fallbackModel, extra string) (mess
 		userPrompts = tmpl.Values(promptfile.HeaderUserPrompt)
 		opts.ResponseFormat, _ = tmpl.Value(promptfile.HeaderResponseFormat)
 		opts.Stop, _ = tmpl.Value(promptfile.HeaderStop)
+		if v, ok := tmpl.Value(promptfile.HeaderTemperature); ok {
+			if f, err := strconv.ParseFloat(v, 64); err == nil {
+				opts.Temperature = &f
+			}
+		}
 	}
 
 	extra = strings.TrimSpace(extra)
@@ -52,10 +58,10 @@ func assembleRequest(tmpl *promptfile.Prompt, fallbackModel, extra string) (mess
 	}
 
 	for _, sp := range systemPrompts {
-		messages = append(messages, kimi.Message{Role: "system", Content: sp})
+		messages = append(messages, llm.Message{Role: "system", Content: sp})
 	}
 	for _, up := range userPrompts {
-		messages = append(messages, kimi.Message{Role: "user", Content: up})
+		messages = append(messages, llm.Message{Role: "user", Content: up})
 	}
 	return messages, model, opts
 }

@@ -1,8 +1,9 @@
 // Package interactive implements the step-based console wizard that starts
 // when aiac9 is launched without arguments: pick an optional pre-filled
-// prompt template (Step A), type a prompt (Step T), send it to the
-// Moonshot AI (Kimi) chat completions API, print the reply, and repeat. See
-// CLAUDE.md's "Логика интерактивного режима" for the spec.
+// prompt template (Step A), type a prompt (Step T), send it to an LLM
+// provider (Moonshot AI/Kimi or DeepSeek, chosen by model name — see
+// internal/llm, internal/kimi, internal/deepseek), print the reply, and
+// repeat. See CLAUDE.md's "Логика интерактивного режима" for the spec.
 package interactive
 
 import (
@@ -15,7 +16,7 @@ import (
 
 	"github.com/fedorvasiliev/aiac9/internal/config"
 	"github.com/fedorvasiliev/aiac9/internal/exchangelog"
-	"github.com/fedorvasiliev/aiac9/internal/kimi"
+	"github.com/fedorvasiliev/aiac9/internal/llm"
 	"github.com/fedorvasiliev/aiac9/internal/promptfile"
 	"github.com/fedorvasiliev/aiac9/internal/secretmask"
 )
@@ -39,11 +40,7 @@ const noPromptOption = "(без промпта)"
 func Run(ctx context.Context, cfg *config.Config, stdin *os.File, stdout io.Writer) error {
 	fmt.Fprintln(stdout, "aiac9 — интерактивный режим (LLM). \"exit\"/\"quit\" или Ctrl+D — выход.")
 
-	client := kimi.NewClient(cfg.MoonshotAPIKey)
-	if cfg.MoonshotBaseURL != "" {
-		client.BaseURL = cfg.MoonshotBaseURL
-	}
-	masker := secretmask.New(cfg.MoonshotAPIKey)
+	masker := secretmask.New(cfg.MoonshotAPIKey, cfg.DeepSeekAPIKey)
 	reader := bufio.NewReader(stdin)
 
 	for {
@@ -81,10 +78,29 @@ func Run(ctx context.Context, cfg *config.Config, stdin *os.File, stdout io.Writ
 			continue
 		}
 
+		client, err := resolveClient(model, cfg)
+		if err != nil {
+			fmt.Fprintln(stdout, masker.Mask(err.Error()))
+			continue
+		}
+
+		// The request must be logged right before it is sent (CLAUDE.md),
+		// not only once the response comes back — so the log file is
+		// started from inside Complete, right before the HTTP call.
+		var logPath string
+		onRequest := func(reqBody []byte) {
+			path, logErr := exchangelog.Start(exchangelog.Dir, model, reqBody, masker)
+			if logErr != nil {
+				fmt.Fprintln(stdout, "не удалось записать лог:", masker.Mask(logErr.Error()))
+				return
+			}
+			logPath = path
+		}
+
 		var content string
-		var ex *kimi.Exchange
+		var ex *llm.Exchange
 		runWithSpinner(stdout, func() {
-			content, ex, err = client.Complete(ctx, model, messages, opts)
+			content, ex, err = client.Complete(ctx, model, messages, opts, onRequest)
 		})
 		if err != nil {
 			fmt.Fprintln(stdout, masker.Mask(err.Error()))
@@ -97,11 +113,12 @@ func Run(ctx context.Context, cfg *config.Config, stdin *os.File, stdout io.Writ
 		fmt.Fprintln(stdout)
 		fmt.Fprintln(stdout, colorize(stdout, ansiGreen, masker.Mask(content)))
 
-		path, err := exchangelog.Write(exchangelog.Dir, ex, masker)
-		if err != nil {
-			fmt.Fprintln(stdout, "не удалось записать лог:", masker.Mask(err.Error()))
-			continue
+		if logPath != "" {
+			if err := exchangelog.Finish(logPath, ex.StatusCode, ex.ResponseBody, masker); err != nil {
+				fmt.Fprintln(stdout, "не удалось дописать лог:", masker.Mask(err.Error()))
+				continue
+			}
+			fmt.Fprintln(stdout, "лог:", logPath)
 		}
-		fmt.Fprintln(stdout, "лог:", path)
 	}
 }

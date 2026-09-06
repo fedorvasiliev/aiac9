@@ -9,26 +9,61 @@ import (
 	"github.com/fedorvasiliev/aiac9/internal/promptfile"
 )
 
+// longValueThreshold: past this many characters a table cell stops being
+// readable, so CLAUDE.md has the whole printout switch to one
+// heading-and-value block per section instead.
+const longValueThreshold = 80
+
 // printPromptTable prints, per CLAUDE.md, "всё что получилось" after
 // parsing a chosen prompt template: one row per non-empty section, first
-// column ("Параметр") in yellow. Multi-line values (System/User prompt) are
-// flattened to a single line for the table; the full text is still what
-// gets sent to the model.
+// column/heading in yellow, empty sections skipped. If any value is longer
+// than longValueThreshold, the compact table would make it unreadable, so
+// every section is printed instead as its own "Заголовок:\n<значение>"
+// block, preserving the value's original line breaks.
 func printPromptTable(stdout io.Writer, p *promptfile.Prompt) {
-	const paramHeader, valueHeader = "Параметр", "Значение"
-
-	type row struct{ param, value string }
-	var rows []row
-	for _, r := range p.Rows() {
-		rows = append(rows, row{r[0], strings.ReplaceAll(r[1], "\n", " ")})
-	}
+	rows := p.Rows()
 	if len(rows) == 0 {
 		return
 	}
 
+	long := false
+	for _, r := range rows {
+		if utf8.RuneCountInString(r[1]) > longValueThreshold {
+			long = true
+			break
+		}
+	}
+
+	if long {
+		printPromptBlocks(stdout, rows)
+		return
+	}
+	printPromptTableCompact(stdout, rows)
+}
+
+func printPromptBlocks(stdout io.Writer, rows [][2]string) {
+	fmt.Fprintln(stdout)
+	for i, r := range rows {
+		if i > 0 {
+			fmt.Fprintln(stdout)
+		}
+		fmt.Fprintf(stdout, "%s:\n%s\n", colorize(stdout, ansiYellow, r[0]), r[1])
+	}
+	fmt.Fprintln(stdout)
+}
+
+func printPromptTableCompact(stdout io.Writer, rows [][2]string) {
+	const paramHeader, valueHeader = "Параметр", "Значение"
+
+	type row struct{ param, value string }
+	flat := make([]row, 0, len(rows))
+	for _, r := range rows {
+		flat = append(flat, row{r[0], strings.ReplaceAll(r[1], "\n", " ")})
+	}
+
 	paramWidth := utf8.RuneCountInString(paramHeader)
 	valueWidth := utf8.RuneCountInString(valueHeader)
-	for _, r := range rows {
+	for _, r := range flat {
 		paramWidth = max(paramWidth, utf8.RuneCountInString(r.param))
 		valueWidth = max(valueWidth, utf8.RuneCountInString(r.value))
 	}
@@ -42,7 +77,7 @@ func printPromptTable(stdout io.Writer, p *promptfile.Prompt) {
 	fmt.Fprintln(stdout)
 	printRow(paramHeader, valueHeader)
 	fmt.Fprintf(stdout, "|%s|%s|\n", strings.Repeat("-", paramWidth+2), strings.Repeat("-", valueWidth+2))
-	for _, r := range rows {
+	for _, r := range flat {
 		printRow(r.param, r.value)
 	}
 	fmt.Fprintln(stdout)

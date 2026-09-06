@@ -7,23 +7,16 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/fedorvasiliev/aiac9/internal/kimi"
 	"github.com/fedorvasiliev/aiac9/internal/secretmask"
 )
 
-func TestWrite_MasksSecretsAndNamesFilePerPattern(t *testing.T) {
+func TestStart_WritesRequestAndNamesFilePerPattern(t *testing.T) {
 	dir := t.TempDir()
 	masker := secretmask.New("supersecret")
-	ex := &kimi.Exchange{
-		Model:        "kimi-k2.6",
-		RequestBody:  []byte(`{"authorization":"supersecret"}`),
-		ResponseBody: []byte(`response containing supersecret too`),
-		StatusCode:   200,
-	}
 
-	path, err := Write(dir, ex, masker)
+	path, err := Start(dir, "kimi-k2.6", []byte(`{"authorization":"supersecret"}`), masker)
 	if err != nil {
-		t.Fatalf("Write returned error: %v", err)
+		t.Fatalf("Start returned error: %v", err)
 	}
 	if filepath.Dir(path) != dir {
 		t.Fatalf("path = %q, want it inside %q", path, dir)
@@ -39,6 +32,38 @@ func TestWrite_MasksSecretsAndNamesFilePerPattern(t *testing.T) {
 		t.Fatalf("read log file: %v", err)
 	}
 	content := string(data)
+	if strings.Contains(content, "supersecret") {
+		t.Fatalf("log content still contains the secret verbatim:\n%s", content)
+	}
+	if !strings.Contains(content, "=== REQUEST ===") {
+		t.Fatalf("expected the request section right away, got:\n%s", content)
+	}
+	if strings.Contains(content, "RESPONSE") {
+		t.Fatalf("Start must not write a response section yet, got:\n%s", content)
+	}
+}
+
+func TestFinish_AppendsResponseToStartsFile(t *testing.T) {
+	dir := t.TempDir()
+	masker := secretmask.New("supersecret")
+
+	path, err := Start(dir, "kimi-k2.6", []byte(`{"model":"kimi-k2.6"}`), masker)
+	if err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+
+	if err := Finish(path, 200, []byte(`response containing supersecret too`), masker); err != nil {
+		t.Fatalf("Finish returned error: %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read log file: %v", err)
+	}
+	content := string(data)
+	if !strings.Contains(content, "=== REQUEST ===") || !strings.Contains(content, "=== RESPONSE (HTTP 200) ===") {
+		t.Fatalf("expected both request and response sections, got:\n%s", content)
+	}
 	if strings.Contains(content, "supersecret") {
 		t.Fatalf("log content still contains the secret verbatim:\n%s", content)
 	}

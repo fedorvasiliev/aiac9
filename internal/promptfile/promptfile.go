@@ -5,7 +5,7 @@
 // A template is a plain-text file with Markdown-style headings ("# Header",
 // "## Header", ...); everything up to the next heading (or EOF) is that
 // heading's value. Recognized headings: Model, System prompt, User prompt,
-// Response format, Words limit, Stop — matched case-insensitively, so
+// Response format, Words limit, Stop, Temperature — matched case-insensitively, so
 // "### User Prompt" and "### user prompt" are equivalent. A file with no
 // heading at all is treated as a single implicit User prompt holding the
 // whole file.
@@ -29,6 +29,7 @@ const (
 	HeaderResponseFormat = "Response format"
 	HeaderWordsLimit     = "Words limit"
 	HeaderStop           = "Stop"
+	HeaderTemperature    = "Temperature"
 )
 
 // Section is one heading and its value, in the order parsed from the file.

@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/fedorvasiliev/aiac9/internal/config"
+	"github.com/fedorvasiliev/aiac9/internal/exchangelog"
 	"github.com/fedorvasiliev/aiac9/internal/promptfile"
 )
 
@@ -95,6 +96,64 @@ func TestRun_NoPromptUsesDefaultModel(t *testing.T) {
 	}
 	if req.Model != defaultModel {
 		t.Fatalf("model = %q, want the built-in default %q", req.Model, defaultModel)
+	}
+}
+
+func TestRun_DeepSeekModelRoutesToDeepSeekAndLogsBothSections(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	var gotAuth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"deep reply"}}]}`))
+	}))
+	defer server.Close()
+
+	if err := os.Mkdir(promptfile.Dir, 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", promptfile.Dir, err)
+	}
+	tmpl := "### Model\ndeepseek-chat\n\n### User Prompt\nhello\n"
+	if err := os.WriteFile(filepath.Join(promptfile.Dir, "ds.md"), []byte(tmpl), 0o644); err != nil {
+		t.Fatalf("write template: %v", err)
+	}
+
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	defer pr.Close()
+
+	go func() {
+		defer pw.Close()
+		// Step A: options are ["(без промпта)", "ds.md"] — pick "2"; Step T: empty.
+		pw.Write([]byte("2\n\n"))
+	}()
+
+	cfg := &config.Config{DeepSeekAPIKey: "deep-secret", DeepSeekBaseURL: server.URL}
+	var out bytes.Buffer
+	if err := Run(context.Background(), cfg, pr, &out); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+
+	if gotAuth != "Bearer deep-secret" {
+		t.Fatalf("Authorization header = %q, want the DeepSeek key", gotAuth)
+	}
+	if !strings.Contains(out.String(), "deep reply") {
+		t.Fatalf("expected the reply to be printed, got:\n%s", out.String())
+	}
+
+	entries, err := os.ReadDir(exchangelog.Dir)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("expected exactly one log file, got %v (err %v)", entries, err)
+	}
+	logData, err := os.ReadFile(filepath.Join(exchangelog.Dir, entries[0].Name()))
+	if err != nil {
+		t.Fatalf("read log file: %v", err)
+	}
+	log := string(logData)
+	if !strings.Contains(log, "=== REQUEST ===") || !strings.Contains(log, "=== RESPONSE (HTTP 200) ===") {
+		t.Fatalf("expected both request and response sections in the log, got:\n%s", log)
 	}
 }
 
