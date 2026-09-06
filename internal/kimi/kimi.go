@@ -41,8 +41,22 @@ func NewClient(apiKey string) *Client {
 }
 
 type request struct {
-	Model    string    `json:"model"`
-	Messages []Message `json:"messages"`
+	Model          string          `json:"model"`
+	Messages       []Message       `json:"messages"`
+	ResponseFormat *responseFormat `json:"response_format,omitempty"`
+	Stop           string          `json:"stop,omitempty"`
+}
+
+type responseFormat struct {
+	Type string `json:"type"`
+}
+
+// Options carries optional per-request parameters beyond model/messages —
+// populated from a selected prompt template's "Response format" and "Stop"
+// headings (see internal/promptfile). The zero value sends neither field.
+type Options struct {
+	ResponseFormat string // -> response_format.type, if non-empty
+	Stop           string // -> stop, if non-empty
 }
 
 type response struct {
@@ -70,12 +84,17 @@ type Exchange struct {
 // along with the raw exchange for logging. ex is populated whenever a
 // request actually reached the network, even if the API returned an error
 // status, so callers can still log what happened.
-func (c *Client) Complete(ctx context.Context, model string, messages []Message) (content string, ex *Exchange, err error) {
+func (c *Client) Complete(ctx context.Context, model string, messages []Message, opts Options) (content string, ex *Exchange, err error) {
 	if c.APIKey == "" {
 		return "", nil, fmt.Errorf("MOONSHOT_API_KEY is not set")
 	}
 
-	reqBody, err := json.Marshal(request{Model: model, Messages: messages})
+	req := request{Model: model, Messages: messages, Stop: opts.Stop}
+	if opts.ResponseFormat != "" {
+		req.ResponseFormat = &responseFormat{Type: opts.ResponseFormat}
+	}
+
+	reqBody, err := json.Marshal(req)
 	if err != nil {
 		return "", nil, fmt.Errorf("encode request: %w", err)
 	}

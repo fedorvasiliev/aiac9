@@ -17,13 +17,15 @@ func TestInputStep_ReturnsTrimmedLine(t *testing.T) {
 	}
 }
 
-func TestInputStep_SkipsEmptyLines(t *testing.T) {
-	reader := bufio.NewReader(strings.NewReader("\n\nfinally\n"))
+func TestInputStep_EmptyLineIsAccepted(t *testing.T) {
+	// CLAUDE.md: "допускается введение пустого значения" — an empty line at
+	// Step T is a valid, immediately accepted answer, not re-prompted.
+	reader := bufio.NewReader(strings.NewReader("\nfinally\n"))
 	var out bytes.Buffer
 
 	got, ok := inputStep(reader, &out, "Label")
-	if !ok || got != "finally" {
-		t.Fatalf("inputStep() = (%q, %v), want (\"finally\", true)", got, ok)
+	if !ok || got != "" {
+		t.Fatalf("inputStep() = (%q, %v), want (\"\", true)", got, ok)
 	}
 }
 

@@ -6,5 +6,9 @@ curl https://api.moonshot.ai/v1/chat/completions \
         "messages": [
             {"role": "system", "content": "You are Kimi, an AI assistant provided by Moonshot AI. You are especially good at conversations in Chinese and English. You provide users with safe, helpful, and accurate answers. You also refuse to answer any questions involving terrorism, racism, pornography, violence, or similar harmful content. Moonshot AI is a proper noun and must not be translated into other languages."},
             {"role": "user", "content": "Hi, my name is Li Lei. What is 1+1?"}
-        ]
+        ],
+        "response_format": {
+            "type": "text"
+        },
+        "stop": "any stop sequence"
    }'
