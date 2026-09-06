@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -97,6 +98,44 @@ func TestRun_NoPromptUsesDefaultModel(t *testing.T) {
 	}
 	if req.Model != defaultModel {
 		t.Fatalf("model = %q, want the built-in default %q", req.Model, defaultModel)
+	}
+}
+
+func TestRun_PrintsTotalTokensAndDuration(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"hi"}}],"usage":{"total_tokens":42}}`))
+	}))
+	defer server.Close()
+
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	defer pr.Close()
+
+	go func() {
+		defer pw.Close()
+		pw.Write([]byte("\nhello\n"))
+	}()
+
+	cfg := &config.Config{MoonshotAPIKey: "secret", MoonshotBaseURL: server.URL}
+	var out bytes.Buffer
+	if err := Run(context.Background(), cfg, pr, &out, Options{}); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+
+	got := out.String()
+	if !strings.Contains(got, "total_tokens: 42") {
+		t.Fatalf("expected total_tokens to be printed, got:\n%s", got)
+	}
+	// "с точностью до сотых долей секунды" — hundredths of a second, i.e.
+	// exactly two decimal places, e.g. "0.00s".
+	if !regexp.MustCompile(`время выполнения: \d+\.\d\ds`).MatchString(got) {
+		t.Fatalf("expected the request duration printed to hundredths of a second, got:\n%s", got)
+	}
+	if !strings.Contains(got, "hi\n\ntotal_tokens:") {
+		t.Fatalf("expected a blank line before total_tokens/duration, got:\n%s", got)
 	}
 }
 

@@ -38,16 +38,20 @@ func Start(dir, model string, reqBody []byte, masker *secretmask.Masker) (string
 	return path, nil
 }
 
-// Finish appends the (masked) response to the log file path, as created by
-// Start.
-func Finish(path string, statusCode int, respBody []byte, masker *secretmask.Masker) error {
+// Finish appends the (masked) response, plus the request's total duration
+// (CLAUDE.md: "в лог также пишем общее время исполнения запроса"), to the
+// log file path, as created by Start.
+func Finish(path string, statusCode int, respBody []byte, duration time.Duration, masker *secretmask.Masker) error {
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		return fmt.Errorf("open log file: %w", err)
 	}
 	defer f.Close()
 
-	content := fmt.Sprintf("\n=== RESPONSE (HTTP %d) ===\n%s\n", statusCode, masker.Mask(string(respBody)))
+	content := fmt.Sprintf(
+		"\n=== RESPONSE (HTTP %d) ===\n%s\n\nВремя выполнения: %s\n",
+		statusCode, masker.Mask(string(respBody)), duration,
+	)
 	if _, err := f.WriteString(content); err != nil {
 		return fmt.Errorf("append response to log file: %w", err)
 	}

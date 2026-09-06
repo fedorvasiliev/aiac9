@@ -133,9 +133,11 @@ func Run(ctx context.Context, cfg *config.Config, stdin *os.File, stdout io.Writ
 
 		fmt.Fprintln(stdout)
 		fmt.Fprintln(stdout, colorize(stdout, ansiGreen, masker.Mask(content)))
+		fmt.Fprintln(stdout)
+		fmt.Fprintf(stdout, "total_tokens: %d, время выполнения: %.2fs\n", ex.TotalTokens, ex.Duration.Seconds())
 
 		if logPath != "" {
-			if err := exchangelog.Finish(logPath, ex.StatusCode, ex.ResponseBody, masker); err != nil {
+			if err := exchangelog.Finish(logPath, ex.StatusCode, ex.ResponseBody, ex.Duration, masker); err != nil {
 				fmt.Fprintln(stdout, "не удалось дописать лог:", masker.Mask(err.Error()))
 				continue
 			}

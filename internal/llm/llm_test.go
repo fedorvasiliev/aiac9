@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNewClient_ConfiguresTimeoutsPerCLAUDEmd(t *testing.T) {
@@ -129,6 +130,46 @@ func TestComplete_SendsResponseFormatStopAndTemperature(t *testing.T) {
 	}
 	if req.Temperature == nil || *req.Temperature != 0.3 {
 		t.Fatalf("temperature = %v, want 0.3", req.Temperature)
+	}
+}
+
+func TestComplete_RecordsUsageAndDuration(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(20 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"hi"}}],"usage":{"prompt_tokens":5,"completion_tokens":7,"total_tokens":12}}`))
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "secret-key")
+
+	_, ex, err := c.Complete(context.Background(), "kimi-k3", []Message{{Role: "user", Content: "hi"}}, Options{}, nil)
+	if err != nil {
+		t.Fatalf("Complete returned error: %v", err)
+	}
+	if ex.TotalTokens != 12 {
+		t.Fatalf("TotalTokens = %d, want 12", ex.TotalTokens)
+	}
+	if ex.Duration < 20*time.Millisecond {
+		t.Fatalf("Duration = %v, want at least 20ms (the server's own delay)", ex.Duration)
+	}
+}
+
+func TestComplete_MissingUsageLeavesTotalTokensZero(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"hi"}}]}`))
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "secret-key")
+
+	_, ex, err := c.Complete(context.Background(), "kimi-k3", []Message{{Role: "user", Content: "hi"}}, Options{}, nil)
+	if err != nil {
+		t.Fatalf("Complete returned error: %v", err)
+	}
+	if ex.TotalTokens != 0 {
+		t.Fatalf("TotalTokens = %d, want 0 when usage is absent", ex.TotalTokens)
 	}
 }
 

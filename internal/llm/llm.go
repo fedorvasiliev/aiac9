@@ -81,6 +81,9 @@ type response struct {
 	Choices []struct {
 		Message Message `json:"message"`
 	} `json:"choices"`
+	Usage *struct {
+		TotalTokens int `json:"total_tokens"`
+	} `json:"usage"`
 	Error *struct {
 		Message string `json:"message"`
 		Type    string `json:"type"`
@@ -96,6 +99,15 @@ type Exchange struct {
 	RequestBody  []byte
 	ResponseBody []byte
 	StatusCode   int
+
+	// Duration is how long the HTTP round trip took (request sent to
+	// response body fully read) — CLAUDE.md requires it printed and
+	// logged.
+	Duration time.Duration
+
+	// TotalTokens is the response's usage.total_tokens, if present —
+	// CLAUDE.md requires it printed alongside the reply.
+	TotalTokens int
 }
 
 // Complete sends messages to model and returns the assistant's reply text
@@ -132,6 +144,7 @@ func (c *Client) Complete(ctx context.Context, model string, messages []Message,
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+c.APIKey)
 
+	start := time.Now()
 	httpResp, err := c.HTTPClient.Do(httpReq)
 	if err != nil {
 		return "", nil, fmt.Errorf("call %s: %w", c.BaseURL, err)
@@ -139,6 +152,7 @@ func (c *Client) Complete(ctx context.Context, model string, messages []Message,
 	defer httpResp.Body.Close()
 
 	respBody, err := io.ReadAll(httpResp.Body)
+	duration := time.Since(start)
 	if err != nil {
 		return "", nil, fmt.Errorf("read response: %w", err)
 	}
@@ -148,11 +162,15 @@ func (c *Client) Complete(ctx context.Context, model string, messages []Message,
 		RequestBody:  reqBody,
 		ResponseBody: respBody,
 		StatusCode:   httpResp.StatusCode,
+		Duration:     duration,
 	}
 
 	var resp response
 	if err := json.Unmarshal(respBody, &resp); err != nil {
 		return "", ex, fmt.Errorf("decode response: %w", err)
+	}
+	if resp.Usage != nil {
+		ex.TotalTokens = resp.Usage.TotalTokens
 	}
 	if resp.Error != nil {
 		return "", ex, fmt.Errorf("api error: %s", resp.Error.Message)
