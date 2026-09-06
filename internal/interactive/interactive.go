@@ -13,6 +13,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/fedorvasiliev/aiac9/internal/config"
 	"github.com/fedorvasiliev/aiac9/internal/exchangelog"
@@ -31,13 +33,26 @@ const defaultModel = "kimi-k2.6"
 // answer would otherwise be unreachable.
 const noPromptOption = "(без промпта)"
 
+// Options are CLI-flag-driven overrides for Run (see internal/cli's
+// "-f"/"-timeout" flags).
+type Options struct {
+	// PromptFilter, if non-empty, restricts Step A's list to ./prompts
+	// file names containing this substring (CLI flag -f).
+	PromptFilter string
+
+	// ResponseTimeout, if non-nil, overrides internal/llm's default
+	// response timeout for every request this run makes (CLI flag
+	// -timeout, given in seconds).
+	ResponseTimeout *time.Duration
+}
+
 // Run drives the interactive wizard: Step A picks an optional prompt
 // template from ./prompts, Step T (the terminal step) reads additional
 // free text and sends the request; the reply is printed and the exchange
 // logged, then the wizard repeats from Step A. It returns when the
 // operator exits (typing "exit"/"quit", or Ctrl+D) or the context is
 // canceled.
-func Run(ctx context.Context, cfg *config.Config, stdin *os.File, stdout io.Writer) error {
+func Run(ctx context.Context, cfg *config.Config, stdin *os.File, stdout io.Writer, opts Options) error {
 	fmt.Fprintln(stdout, "aiac9 — интерактивный режим (LLM). \"exit\"/\"quit\" или Ctrl+D — выход.")
 
 	masker := secretmask.New(cfg.MoonshotAPIKey, cfg.DeepSeekAPIKey)
@@ -51,6 +66,9 @@ func Run(ctx context.Context, cfg *config.Config, stdin *os.File, stdout io.Writ
 		names, err := promptfile.List(promptfile.Dir)
 		if err != nil {
 			fmt.Fprintf(stdout, "не удалось прочитать ./%s: %v\n", promptfile.Dir, err)
+		}
+		if opts.PromptFilter != "" {
+			names = filterNames(names, opts.PromptFilter)
 		}
 		promptOption, ok := selectStep(stdin, reader, stdout, "Use prompt", append([]string{noPromptOption}, names...), 0)
 		if !ok {
@@ -72,7 +90,7 @@ func Run(ctx context.Context, cfg *config.Config, stdin *os.File, stdout io.Writ
 			return nil
 		}
 
-		messages, model, opts := assembleRequest(tmpl, defaultModel, extra)
+		messages, model, llmOpts := assembleRequest(tmpl, defaultModel, extra)
 		if len(messages) == 0 {
 			fmt.Fprintln(stdout, "нечего отправлять: выберите промпт-шаблон или введите текст")
 			continue
@@ -82,6 +100,9 @@ func Run(ctx context.Context, cfg *config.Config, stdin *os.File, stdout io.Writ
 		if err != nil {
 			fmt.Fprintln(stdout, masker.Mask(err.Error()))
 			continue
+		}
+		if opts.ResponseTimeout != nil {
+			client.HTTPClient.Timeout = *opts.ResponseTimeout
 		}
 
 		// The request must be logged right before it is sent (CLAUDE.md),
@@ -100,7 +121,7 @@ func Run(ctx context.Context, cfg *config.Config, stdin *os.File, stdout io.Writ
 		var content string
 		var ex *llm.Exchange
 		runWithSpinner(stdout, func() {
-			content, ex, err = client.Complete(ctx, model, messages, opts, onRequest)
+			content, ex, err = client.Complete(ctx, model, messages, llmOpts, onRequest)
 		})
 		if err != nil {
 			fmt.Fprintln(stdout, masker.Mask(err.Error()))
@@ -121,4 +142,15 @@ func Run(ctx context.Context, cfg *config.Config, stdin *os.File, stdout io.Writ
 			fmt.Fprintln(stdout, "лог:", logPath)
 		}
 	}
+}
+
+// filterNames keeps only the names containing substr.
+func filterNames(names []string, substr string) []string {
+	var out []string
+	for _, n := range names {
+		if strings.Contains(n, substr) {
+			out = append(out, n)
+		}
+	}
+	return out
 }

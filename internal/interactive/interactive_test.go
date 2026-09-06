@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/fedorvasiliev/aiac9/internal/config"
 	"github.com/fedorvasiliev/aiac9/internal/exchangelog"
@@ -26,7 +27,7 @@ func TestRun_ExitsCleanlyOnImmediateEOF(t *testing.T) {
 	defer pr.Close()
 
 	var out bytes.Buffer
-	if err := Run(context.Background(), &config.Config{}, pr, &out); err != nil {
+	if err := Run(context.Background(), &config.Config{}, pr, &out, Options{}); err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
 	if !strings.Contains(out.String(), "Use prompt") {
@@ -53,7 +54,7 @@ func TestRun_ReportsMissingAPIKeyAndLoopsBackToSelect(t *testing.T) {
 	}()
 
 	var out bytes.Buffer
-	if err := Run(context.Background(), &config.Config{}, pr, &out); err != nil {
+	if err := Run(context.Background(), &config.Config{}, pr, &out, Options{}); err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
 	if !strings.Contains(out.String(), "MOONSHOT_API_KEY is not set") {
@@ -84,7 +85,7 @@ func TestRun_NoPromptUsesDefaultModel(t *testing.T) {
 
 	cfg := &config.Config{MoonshotAPIKey: "secret", MoonshotBaseURL: server.URL}
 	var out bytes.Buffer
-	if err := Run(context.Background(), cfg, pr, &out); err != nil {
+	if err := Run(context.Background(), cfg, pr, &out, Options{}); err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
 
@@ -96,6 +97,75 @@ func TestRun_NoPromptUsesDefaultModel(t *testing.T) {
 	}
 	if req.Model != defaultModel {
 		t.Fatalf("model = %q, want the built-in default %q", req.Model, defaultModel)
+	}
+}
+
+func TestRun_PromptFilterRestrictsStepAList(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	if err := os.Mkdir(promptfile.Dir, 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", promptfile.Dir, err)
+	}
+	for _, name := range []string{"any-w1d4.prompt.md", "w1d2-1-pure.prompt.md"} {
+		if err := os.WriteFile(filepath.Join(promptfile.Dir, name), []byte("hi"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	defer pr.Close()
+	pw.Close() // just inspect the printed Step A list, then EOF
+
+	var out bytes.Buffer
+	if err := Run(context.Background(), &config.Config{}, pr, &out, Options{PromptFilter: "w1d4"}); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+
+	got := out.String()
+	if !strings.Contains(got, "any-w1d4.prompt.md") {
+		t.Fatalf("expected the matching file to be listed, got:\n%s", got)
+	}
+	if strings.Contains(got, "w1d2-1-pure.prompt.md") {
+		t.Fatalf("expected the non-matching file to be filtered out, got:\n%s", got)
+	}
+}
+
+func TestRun_ResponseTimeoutOverride(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"too late"}}]}`))
+	}))
+	defer server.Close()
+
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	defer pr.Close()
+
+	go func() {
+		defer pw.Close()
+		pw.Write([]byte("\nhello\nexit\n"))
+	}()
+
+	cfg := &config.Config{MoonshotAPIKey: "secret", MoonshotBaseURL: server.URL}
+	timeout := 50 * time.Millisecond
+	var out bytes.Buffer
+	start := time.Now()
+	if err := Run(context.Background(), cfg, pr, &out, Options{ResponseTimeout: &timeout}); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	elapsed := time.Since(start)
+
+	if elapsed >= 200*time.Millisecond {
+		t.Fatalf("Run took %v, want it to time out well before the server's 200ms reply", elapsed)
+	}
+	if !strings.Contains(out.String(), "Client.Timeout") && !strings.Contains(strings.ToLower(out.String()), "timeout") {
+		t.Fatalf("expected a timeout error to be printed, got:\n%s", out.String())
 	}
 }
 
@@ -132,7 +202,7 @@ func TestRun_DeepSeekModelRoutesToDeepSeekAndLogsBothSections(t *testing.T) {
 
 	cfg := &config.Config{DeepSeekAPIKey: "deep-secret", DeepSeekBaseURL: server.URL}
 	var out bytes.Buffer
-	if err := Run(context.Background(), cfg, pr, &out); err != nil {
+	if err := Run(context.Background(), cfg, pr, &out, Options{}); err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
 
@@ -192,7 +262,7 @@ func TestRun_StepAAppliesPromptTemplate(t *testing.T) {
 
 	cfg := &config.Config{MoonshotAPIKey: "secret", MoonshotBaseURL: server.URL}
 	var out bytes.Buffer
-	if err := Run(context.Background(), cfg, pr, &out); err != nil {
+	if err := Run(context.Background(), cfg, pr, &out, Options{}); err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
 
