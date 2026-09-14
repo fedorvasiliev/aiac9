@@ -35,8 +35,8 @@ func TestRun_ExitsCleanlyOnImmediateEOF(t *testing.T) {
 	if err := Run(context.Background(), &config.Config{}, pr, &out, Options{}); err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
-	if !strings.Contains(out.String(), "Use prompt") {
-		t.Fatalf("expected the Step A select prompt to have been printed, got:\n%s", out.String())
+	if !strings.Contains(out.String(), "Dialog") {
+		t.Fatalf("expected the Step D select prompt to have been printed, got:\n%s", out.String())
 	}
 }
 
@@ -53,11 +53,12 @@ func TestRun_ReportsMissingAPIKeyAndLoopsBackToSelect(t *testing.T) {
 
 	go func() {
 		defer pw.Close()
-		// Step A: accept the default (empty line = "no prompt"); Step T: a
-		// prompt. No MOONSHOT_API_KEY is configured, so Complete fails
-		// locally without any network call, Run reports it, and loops back
-		// to Step A — where this pipe's EOF then ends the wizard.
-		pw.Write([]byte("\nkakoy segodnya den?\n"))
+		// Step D: accept the default ("/new"); Step A: accept the default
+		// (no template); Step T: a prompt. No MOONSHOT_API_KEY is
+		// configured, so Complete fails locally without any network call,
+		// Run reports it, and loops back to Step A — where this pipe's EOF
+		// then ends the wizard.
+		pw.Write([]byte("\n\nkakoy segodnya den?\n"))
 	}()
 
 	var out bytes.Buffer
@@ -88,8 +89,9 @@ func TestRun_NoPromptUsesDefaultModel(t *testing.T) {
 
 	go func() {
 		defer pw.Close()
-		// Step A: accept the default ("no prompt"); Step T: a plain prompt.
-		pw.Write([]byte("\nhello there\n"))
+		// Step D: accept the default ("/new"); Step A: accept the default
+		// ("no prompt"); Step T: a plain prompt.
+		pw.Write([]byte("\n\nhello there\n"))
 	}()
 
 	cfg := &config.Config{MoonshotAPIKey: "secret", MoonshotBaseURL: server.URL}
@@ -126,7 +128,7 @@ func TestRun_PrintsTotalTokensAndDuration(t *testing.T) {
 
 	go func() {
 		defer pw.Close()
-		pw.Write([]byte("\nhello\n"))
+		pw.Write([]byte("\n\nhello\n")) // Step D default, Step A default, Step T
 	}()
 
 	cfg := &config.Config{MoonshotAPIKey: "secret", MoonshotBaseURL: server.URL}
@@ -169,9 +171,11 @@ func TestRun_AccumulatesDialogHistoryAcrossTurns(t *testing.T) {
 
 	go func() {
 		defer pw.Close()
-		// Turn 1 ("first question"), then turn 2 ("second question") — no
-		// /clear/-new in between, so they belong to the same dialog.
-		pw.Write([]byte("\nfirst question\n\nsecond question\n"))
+		pw.Write([]byte("\n"))               // Step D: default ("/new")
+		pw.Write([]byte("\n"))               // Step A turn 1: default (no template)
+		pw.Write([]byte("first question\n")) // Step T turn 1
+		pw.Write([]byte("\n"))               // Step A turn 2: default
+		pw.Write([]byte("second question\n"))
 	}()
 
 	cfg := &config.Config{MoonshotAPIKey: "secret", MoonshotBaseURL: server.URL}
@@ -184,6 +188,9 @@ func TestRun_AccumulatesDialogHistoryAcrossTurns(t *testing.T) {
 		t.Fatalf("got %d requests, want 2", len(gotBodies))
 	}
 
+	// The second request must fold turn 1's question and reply into one
+	// system message (CLAUDE.md's Step D: "обогатить ей system prompt"),
+	// ahead of the new turn's own user message.
 	var req2 struct {
 		Messages []struct {
 			Role    string `json:"role"`
@@ -193,14 +200,14 @@ func TestRun_AccumulatesDialogHistoryAcrossTurns(t *testing.T) {
 	if err := json.Unmarshal(gotBodies[1], &req2); err != nil {
 		t.Fatalf("decode second request: %v", err)
 	}
-	want := []string{"first question", "reply", "second question"}
-	if len(req2.Messages) != len(want) {
-		t.Fatalf("second request messages = %+v, want content %v", req2.Messages, want)
+	if len(req2.Messages) != 2 {
+		t.Fatalf("second request messages = %+v, want exactly 2 (context system message + new user message)", req2.Messages)
 	}
-	for i, w := range want {
-		if req2.Messages[i].Content != w {
-			t.Fatalf("second request messages = %+v, want content %v", req2.Messages, want)
-		}
+	if req2.Messages[0].Role != "system" || !strings.Contains(req2.Messages[0].Content, "first question") || !strings.Contains(req2.Messages[0].Content, "reply") {
+		t.Fatalf("second request messages[0] = %+v, want a system message containing turn 1's question and reply", req2.Messages[0])
+	}
+	if req2.Messages[1].Role != "user" || req2.Messages[1].Content != "second question" {
+		t.Fatalf("second request messages[1] = %+v, want {user, \"second question\"}", req2.Messages[1])
 	}
 }
 
@@ -224,8 +231,14 @@ func TestRun_ClearCommandResetsDialogHistory(t *testing.T) {
 
 	go func() {
 		defer pw.Close()
-		// Turn 1, then "/clear", then a turn in the fresh dialog.
-		pw.Write([]byte("\nfirst question\n\n/clear\n\nsecond question\n"))
+		pw.Write([]byte("\n"))               // Step D (dialog 1): default ("/new")
+		pw.Write([]byte("\n"))               // Step A (dialog 1): default
+		pw.Write([]byte("first question\n")) // Step T (dialog 1)
+		pw.Write([]byte("\n"))               // Step A (dialog 1), 2nd turn: default
+		pw.Write([]byte("/clear\n"))         // Step T (dialog 1), 2nd turn: reset
+		pw.Write([]byte("\n"))               // Step D (dialog 2): default ("/new")
+		pw.Write([]byte("\n"))               // Step A (dialog 2): default
+		pw.Write([]byte("second question\n"))
 	}()
 
 	cfg := &config.Config{MoonshotAPIKey: "secret", MoonshotBaseURL: server.URL}
@@ -250,7 +263,7 @@ func TestRun_ClearCommandResetsDialogHistory(t *testing.T) {
 		t.Fatalf("decode second request: %v", err)
 	}
 	if len(req2.Messages) != 1 || req2.Messages[0].Content != "second question" {
-		t.Fatalf("expected /clear to reset history, second request messages = %+v", req2.Messages)
+		t.Fatalf("expected /clear to reset the dialog context, second request messages = %+v", req2.Messages)
 	}
 }
 
@@ -271,7 +284,7 @@ func TestRun_PersistsMessagesToDialogStore(t *testing.T) {
 
 	go func() {
 		defer pw.Close()
-		pw.Write([]byte("\nhello\nexit\n"))
+		pw.Write([]byte("\n\nhello\nexit\n")) // Step D default, Step A default, Step T, then "exit" at Step A
 	}()
 
 	cfg := &config.Config{MoonshotAPIKey: "secret", MoonshotBaseURL: server.URL}
@@ -306,6 +319,92 @@ func TestRun_PersistsMessagesToDialogStore(t *testing.T) {
 	}
 }
 
+func TestRun_ResumingExistingDialogSeedsContextAndPrintsHistory(t *testing.T) {
+	t.Chdir(t.TempDir()) // shared aiac9.db across both Run calls below
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"reply-1"}}]}`))
+	}))
+	defer server.Close()
+	cfg := &config.Config{MoonshotAPIKey: "secret", MoonshotBaseURL: server.URL}
+
+	// First run: a fresh dialog with one turn, then exit — leaves one row
+	// behind in ./aiac9.db for Step D to list next time.
+	pr1, pw1, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	go func() {
+		defer pw1.Close()
+		pw1.Write([]byte("\n"))           // Step D: default ("/new")
+		pw1.Write([]byte("\n"))           // Step A: default
+		pw1.Write([]byte("question-1\n")) // Step T
+		pw1.Write([]byte("exit\n"))       // Step A, next turn: exit
+	}()
+	var out1 bytes.Buffer
+	if err := Run(context.Background(), cfg, pr1, &out1, Options{}); err != nil {
+		t.Fatalf("first Run returned error: %v", err)
+	}
+	pr1.Close()
+
+	// Second run: Step D now lists that dialog as option "2" (after
+	// "/new"); resuming it should print its last Q&A and seed context for
+	// the next request.
+	var gotBody []byte
+	server2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"reply-2"}}]}`))
+	}))
+	defer server2.Close()
+	cfg2 := &config.Config{MoonshotAPIKey: "secret", MoonshotBaseURL: server2.URL}
+
+	pr2, pw2, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	defer pr2.Close()
+	go func() {
+		defer pw2.Close()
+		pw2.Write([]byte("2\n"))          // Step D: resume the existing dialog
+		pw2.Write([]byte("\n"))           // Step A: default
+		pw2.Write([]byte("question-2\n")) // Step T
+	}()
+
+	var out2 bytes.Buffer
+	if err := Run(context.Background(), cfg2, pr2, &out2, Options{}); err != nil {
+		t.Fatalf("second Run returned error: %v", err)
+	}
+
+	got := out2.String()
+	if !strings.Contains(got, "Вопрос:") || !strings.Contains(got, "question-1") {
+		t.Fatalf("expected the resumed dialog's last question to be printed, got:\n%s", got)
+	}
+	if !strings.Contains(got, "Ответ:") || !strings.Contains(got, "reply-1") {
+		t.Fatalf("expected the resumed dialog's last answer to be printed, got:\n%s", got)
+	}
+
+	var req struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(gotBody, &req); err != nil {
+		t.Fatalf("decode request: %v\nbody: %s", err, gotBody)
+	}
+	if len(req.Messages) != 2 || req.Messages[0].Role != "system" {
+		t.Fatalf("messages = %+v, want a leading system message plus the new user message", req.Messages)
+	}
+	if !strings.Contains(req.Messages[0].Content, "question-1") || !strings.Contains(req.Messages[0].Content, "reply-1") {
+		t.Fatalf("system message = %q, want it to contain the resumed dialog's full history", req.Messages[0].Content)
+	}
+	if req.Messages[1].Content != "question-2" {
+		t.Fatalf("messages[1] = %+v, want the new turn's own question", req.Messages[1])
+	}
+}
+
 func TestRun_PromptFilterRestrictsStepAList(t *testing.T) {
 	t.Chdir(t.TempDir())
 
@@ -323,7 +422,11 @@ func TestRun_PromptFilterRestrictsStepAList(t *testing.T) {
 		t.Fatalf("os.Pipe: %v", err)
 	}
 	defer pr.Close()
-	pw.Close() // just inspect the printed Step A list, then EOF
+
+	go func() {
+		defer pw.Close()
+		pw.Write([]byte("\n")) // Step D: default ("/new"), then EOF at Step A — just inspect its printed list
+	}()
 
 	var out bytes.Buffer
 	if err := Run(context.Background(), &config.Config{}, pr, &out, Options{PromptFilter: "w1d4"}); err != nil {
@@ -357,7 +460,7 @@ func TestRun_ResponseTimeoutOverride(t *testing.T) {
 
 	go func() {
 		defer pw.Close()
-		pw.Write([]byte("\nhello\nexit\n"))
+		pw.Write([]byte("\n\nhello\nexit\n")) // Step D default, Step A default, Step T, then "exit" at Step A
 	}()
 
 	cfg := &config.Config{MoonshotAPIKey: "secret", MoonshotBaseURL: server.URL}
@@ -405,7 +508,7 @@ func TestRun_DeepSeekModelRoutesToDeepSeekAndLogsBothSections(t *testing.T) {
 	go func() {
 		defer pw.Close()
 		// Step A: options are ["(без промпта)", "ds.md"] — pick "2"; Step T: empty.
-		pw.Write([]byte("2\n\n"))
+		pw.Write([]byte("\n2\n\n")) // Step D default, Step A pick #2, Step T empty
 	}()
 
 	cfg := &config.Config{DeepSeekAPIKey: "deep-secret", DeepSeekBaseURL: server.URL}
@@ -465,7 +568,7 @@ func TestRun_StepAAppliesPromptTemplate(t *testing.T) {
 		// Step A: options are ["(без промпта)", "greet.md"] — pick "2"
 		// (its Model heading overrides the built-in default model); Step T:
 		// accept empty (nothing to add on top of the template).
-		pw.Write([]byte("2\n\n"))
+		pw.Write([]byte("\n2\n\n")) // Step D default, Step A pick #2, Step T empty
 	}()
 
 	cfg := &config.Config{MoonshotAPIKey: "secret", MoonshotBaseURL: server.URL}

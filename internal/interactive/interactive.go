@@ -1,12 +1,13 @@
 // Package interactive implements the step-based console wizard that starts
-// when aiac9 is launched without arguments: pick an optional pre-filled
-// prompt template (Step A), type a prompt (Step T), send it to an LLM
-// provider (Moonshot AI/Kimi or DeepSeek, chosen by model name — see
-// internal/llm, internal/kimi, internal/deepseek), print the reply, and
-// repeat. Repeated turns accumulate into one dialog (CLAUDE.md's
-// "## Диалоги"), persisted to SQLite, until the operator resets it with
-// "/clear" or "/new". See CLAUDE.md's "Логика интерактивного режима" for
-// the step-by-step spec.
+// when aiac9 is launched without arguments: pick or resume a dialog (Step
+// D), pick an optional pre-filled prompt template (Step A), type a prompt
+// (Step T), send it to an LLM provider (Moonshot AI/Kimi or DeepSeek,
+// chosen by model name — see internal/llm, internal/kimi,
+// internal/deepseek), print the reply, and repeat. Repeated turns
+// accumulate into one dialog (CLAUDE.md's "## Диалоги"), persisted to
+// SQLite, until the operator resets it with "/clear", "/new", or by
+// re-selecting at Step D. See CLAUDE.md's "Логика интерактивного режима"
+// for the step-by-step spec.
 package interactive
 
 import (
@@ -31,11 +32,14 @@ import (
 // the selected one doesn't specify a Model heading.
 const defaultModel = "kimi-k2.6"
 
-// noPromptOption is Step A's synthetic first choice, standing in for "don't
-// use a template" — CLAUDE.md describes Step A's list as coming from
-// ./prompts but never states it's mandatory, and Step T's own free-text
-// answer would otherwise be unreachable.
-const noPromptOption = "(без промпта)"
+// userPromptOption is Step A's default first choice — "no template, just
+// whatever gets typed at Step T" — named after CLAUDE.md's
+// "Пользовательский промпт".
+const userPromptOption = "Пользовательский промпт"
+
+// newDialogOption is Step D's default first choice, standing in for
+// "start a fresh dialog" per CLAUDE.md.
+const newDialogOption = "/new"
 
 // Options are CLI-flag-driven overrides for Run (see internal/cli's
 // "-f"/"-timeout" flags).
@@ -50,14 +54,14 @@ type Options struct {
 	ResponseTimeout *time.Duration
 }
 
-// Run drives the interactive wizard. Each dialog — the sequence of turns
-// between an operator "/clear"/"/new" reset and the next one — runs in its
-// own goroutine (CLAUDE.md: "каждый диалог должен обрабатываться в
-// отдельной горутине"), so that a future mode juggling many concurrent
-// dialogs needs no rework here; today, with a single stdin to read from,
-// only one such goroutine is ever running at a time. Run returns when the
-// operator exits (typing "exit"/"quit", or Ctrl+D) or the context is
-// canceled.
+// Run drives the interactive wizard. Each dialog — from its Step D
+// selection to the operator resetting it (typing "/clear"/"/new" at Step
+// T, or re-picking at the next Step D) — runs in its own goroutine
+// (CLAUDE.md: "каждый диалог должен обрабатываться в отдельной
+// горутине"), so that a future mode juggling many concurrent dialogs needs
+// no rework here; today, with a single stdin to read from, only one such
+// goroutine is ever running at a time. Run returns when the operator exits
+// (typing "exit"/"quit", or Ctrl+D) or the context is canceled.
 func Run(ctx context.Context, cfg *config.Config, stdin *os.File, stdout io.Writer, opts Options) error {
 	fmt.Fprintln(stdout, "aiac9 — интерактивный режим (LLM). \"exit\"/\"quit\" или Ctrl+D — выход, \"/clear\"/\"/new\" — новый диалог.")
 
@@ -78,7 +82,7 @@ func Run(ctx context.Context, cfg *config.Config, stdin *os.File, stdout io.Writ
 		}
 
 		resultCh := make(chan dialogResult, 1)
-		go runDialog(ctx, cfg, newDialogID(), store, masker, stdin, reader, stdout, opts, resultCh)
+		go runDialog(ctx, cfg, store, masker, stdin, reader, stdout, opts, resultCh)
 
 		result := <-resultCh
 		if result.err != nil {
@@ -92,7 +96,7 @@ func Run(ctx context.Context, cfg *config.Config, stdin *os.File, stdout io.Writ
 
 // dialogResult is how a runDialog goroutine reports back to Run.
 type dialogResult struct {
-	restart bool // true: the operator typed "/clear"/"/new" — start a fresh dialog
+	restart bool // true: the operator typed "/clear"/"/new" — return to Step D
 	err     error
 }
 
@@ -107,12 +111,17 @@ func isNewDialogCommand(extra string) bool {
 	return strings.EqualFold(extra, "/clear") || strings.EqualFold(extra, "/new")
 }
 
-// runDialog handles one dialog's whole lifetime: repeated Step A/Step T
-// cycles, accumulating message history so each new request carries the
-// prior turns as context (CLAUDE.md's "## Диалоги"). It sends exactly one
+// runDialog handles one dialog's whole lifetime: Step D picks it, then
+// repeated Step A/Step T cycles accumulate its history as a system-prompt
+// digest so each new request carries the prior turns as context
+// (CLAUDE.md's "## Диалоги" and "Шаг D"). It sends exactly one
 // dialogResult to resultCh before returning.
-func runDialog(ctx context.Context, cfg *config.Config, dialogID string, store *dialogstore.Store, masker *secretmask.Masker, stdin *os.File, reader *bufio.Reader, stdout io.Writer, opts Options, resultCh chan<- dialogResult) {
-	var history []llm.Message
+func runDialog(ctx context.Context, cfg *config.Config, store *dialogstore.Store, masker *secretmask.Masker, stdin *os.File, reader *bufio.Reader, stdout io.Writer, opts Options, resultCh chan<- dialogResult) {
+	dialogID, dialogContext, ok := selectDialog(store, stdin, reader, stdout)
+	if !ok {
+		resultCh <- dialogResult{}
+		return
+	}
 
 	for {
 		if ctx.Err() != nil {
@@ -127,14 +136,14 @@ func runDialog(ctx context.Context, cfg *config.Config, dialogID string, store *
 		if opts.PromptFilter != "" {
 			names = filterNames(names, opts.PromptFilter)
 		}
-		promptOption, ok := selectStep(stdin, reader, stdout, "Use prompt", append([]string{noPromptOption}, names...), 0)
+		promptOption, ok := selectStep(stdin, reader, stdout, "Use prompt", append([]string{userPromptOption}, names...), 0)
 		if !ok {
 			resultCh <- dialogResult{}
 			return
 		}
 
 		var tmpl *promptfile.Prompt
-		if promptOption != noPromptOption {
+		if promptOption != userPromptOption {
 			tmpl, err = promptfile.Parse(filepath.Join(promptfile.Dir, promptOption))
 			if err != nil {
 				fmt.Fprintf(stdout, "не удалось разобрать %s: %v\n", promptOption, err)
@@ -169,10 +178,13 @@ func runDialog(ctx context.Context, cfg *config.Config, dialogID string, store *
 			client.HTTPClient.Timeout = *opts.ResponseTimeout
 		}
 
-		// The dialog's prior turns are the context; this turn's own
-		// messages are appended on top of it for the actual API call.
-		fullMessages := make([]llm.Message, 0, len(history)+len(turnMessages))
-		fullMessages = append(fullMessages, history...)
+		// The dialog's history so far is folded into one system message
+		// (CLAUDE.md's Step D: "обогатить ей system prompt"), ahead of
+		// this turn's own messages.
+		fullMessages := make([]llm.Message, 0, len(turnMessages)+1)
+		if dialogContext != "" {
+			fullMessages = append(fullMessages, llm.Message{Role: "system", Content: dialogContext})
+		}
 		fullMessages = append(fullMessages, turnMessages...)
 
 		// The request must be logged right before it is sent (CLAUDE.md),
@@ -215,8 +227,8 @@ func runDialog(ctx context.Context, cfg *config.Config, dialogID string, store *
 			}
 		}
 
-		// This turn's messages plus the reply become part of the dialog's
-		// context for its next turn, and are persisted per CLAUDE.md.
+		// This turn's messages plus the reply enrich the dialog's context
+		// for its next turn, and are persisted per CLAUDE.md.
 		if store != nil {
 			for _, m := range turnMessages {
 				if err := store.AppendMessage(dialogID, m.Role, m.Content); err != nil {
@@ -227,8 +239,130 @@ func runDialog(ctx context.Context, cfg *config.Config, dialogID string, store *
 				fmt.Fprintln(stdout, "не удалось сохранить сообщение диалога:", err)
 			}
 		}
-		history = append(history, turnMessages...)
-		history = append(history, llm.Message{Role: "assistant", Content: content})
+		for _, m := range turnMessages {
+			appendDialogContext(&dialogContext, m.Role, m.Content)
+		}
+		appendDialogContext(&dialogContext, "assistant", content)
+	}
+}
+
+// selectDialog runs Step D: pick "/new" to start a fresh dialog, or an
+// existing one to resume it. Resuming prints its last two Q&A pairs (per
+// CLAUDE.md) and returns its full history folded into one system-prompt
+// context string (see appendDialogContext). ok is false when the operator
+// exited (Ctrl+D, "exit"/"quit", or "q").
+func selectDialog(store *dialogstore.Store, stdin *os.File, reader *bufio.Reader, stdout io.Writer) (dialogID, dialogContext string, ok bool) {
+	var summaries []dialogstore.DialogSummary
+	if store != nil {
+		var err error
+		summaries, err = store.ListDialogs()
+		if err != nil {
+			fmt.Fprintln(stdout, "не удалось прочитать список диалогов:", err)
+		}
+	}
+
+	options := make([]string, 0, len(summaries)+1)
+	options = append(options, newDialogOption)
+	labelToID := make(map[string]string, len(summaries))
+	for _, s := range summaries {
+		options = append(options, s.Label)
+		labelToID[s.Label] = s.ID
+	}
+
+	choice, selected := selectStep(stdin, reader, stdout, "Dialog", options, 0)
+	if !selected {
+		return "", "", false
+	}
+	if choice == newDialogOption {
+		return newDialogID(), "", true
+	}
+
+	id := labelToID[choice]
+	var history []dialogstore.Message
+	if store != nil {
+		var err error
+		history, err = store.History(id)
+		if err != nil {
+			fmt.Fprintln(stdout, "не удалось загрузить историю диалога:", err)
+		}
+	}
+
+	printRecentHistory(stdout, history, 2)
+
+	for _, m := range history {
+		appendDialogContext(&dialogContext, m.Role, m.Content)
+	}
+	return id, dialogContext, true
+}
+
+// appendDialogContext folds one more message into *ctx, in the same
+// "Role: content" line format used both to seed a resumed dialog's context
+// (from its stored history) and to grow it turn by turn.
+func appendDialogContext(ctx *string, role, content string) {
+	line := fmt.Sprintf("%s: %s", dialogRoleLabel(role), content)
+	if *ctx == "" {
+		*ctx = "Контекст предыдущего диалога:\n" + line
+		return
+	}
+	*ctx = *ctx + "\n" + line
+}
+
+func dialogRoleLabel(role string) string {
+	switch role {
+	case "user":
+		return "User"
+	case "assistant":
+		return "Assistant"
+	case "system":
+		return "System"
+	default:
+		return role
+	}
+}
+
+// qaPair is one question/answer turn, for printRecentHistory.
+type qaPair struct{ question, answer string }
+
+// lastQAPairs pairs each "user" message with the "assistant" message that
+// follows it, and returns at most the last n such pairs, oldest first.
+func lastQAPairs(history []dialogstore.Message, n int) []qaPair {
+	var pairs []qaPair
+	var pendingQuestion string
+	haveQuestion := false
+	for _, m := range history {
+		switch m.Role {
+		case "user":
+			pendingQuestion = m.Content
+			haveQuestion = true
+		case "assistant":
+			if haveQuestion {
+				pairs = append(pairs, qaPair{question: pendingQuestion, answer: m.Content})
+				haveQuestion = false
+			}
+		}
+	}
+	if len(pairs) > n {
+		pairs = pairs[len(pairs)-n:]
+	}
+	return pairs
+}
+
+// printRecentHistory prints the last n Q&A pairs of history, per CLAUDE.md
+// Step D: "в консоли необходимо вывести последние 2 вопроса и ответа из
+// истории диалога (выводим в стандартном виде)" — the same yellow-label,
+// green-answer style used for a live turn's own output.
+func printRecentHistory(stdout io.Writer, history []dialogstore.Message, n int) {
+	pairs := lastQAPairs(history, n)
+	if len(pairs) == 0 {
+		return
+	}
+
+	fmt.Fprintln(stdout)
+	for _, p := range pairs {
+		fmt.Fprintln(stdout, colorize(stdout, ansiYellow, "Вопрос:"), p.question)
+		fmt.Fprintln(stdout, colorize(stdout, ansiYellow, "Ответ:"))
+		fmt.Fprintln(stdout, colorize(stdout, ansiGreen, p.answer))
+		fmt.Fprintln(stdout)
 	}
 }
 

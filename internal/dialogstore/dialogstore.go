@@ -12,7 +12,9 @@ package dialogstore
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -56,12 +58,121 @@ CREATE TABLE IF NOT EXISTS dialog (
 func (s *Store) AppendMessage(dialogID, role, content string) error {
 	_, err := s.db.Exec(
 		`INSERT INTO dialog (dialog_id, role, content, created_at) VALUES (?, ?, ?, ?)`,
-		dialogID, role, content, time.Now(),
+		// Stored as text (not a driver-specific time.Time encoding) so it
+		// round-trips predictably regardless of SQL driver quirks.
+		dialogID, role, content, time.Now().Format(time.RFC3339Nano),
 	)
 	if err != nil {
 		return fmt.Errorf("insert dialog message: %w", err)
 	}
 	return nil
+}
+
+// Message is one persisted dialog message, as returned by History.
+type Message struct {
+	Role    string
+	Content string
+}
+
+// History returns every message of dialogID, oldest first.
+func (s *Store) History(dialogID string) ([]Message, error) {
+	rows, err := s.db.Query(`SELECT role, content FROM dialog WHERE dialog_id = ? ORDER BY id`, dialogID)
+	if err != nil {
+		return nil, fmt.Errorf("query dialog history: %w", err)
+	}
+	defer rows.Close()
+
+	var history []Message
+	for rows.Next() {
+		var m Message
+		if err := rows.Scan(&m.Role, &m.Content); err != nil {
+			return nil, fmt.Errorf("scan dialog message: %w", err)
+		}
+		history = append(history, m)
+	}
+	return history, rows.Err()
+}
+
+// DialogSummary identifies one existing dialog for Step D's selection list
+// (CLAUDE.md): ID is the value to pass to History, Label is what to show
+// the operator.
+type DialogSummary struct {
+	ID    string
+	Label string
+}
+
+// ListDialogs returns a summary of every dialog with at least one message,
+// most recently active first.
+func (s *Store) ListDialogs() ([]DialogSummary, error) {
+	rows, err := s.db.Query(`
+		SELECT dialog_id, MAX(created_at) AS last_at
+		FROM dialog
+		GROUP BY dialog_id
+		ORDER BY last_at DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("list dialogs: %w", err)
+	}
+	defer rows.Close()
+
+	var ids []string
+	var lastAts []string
+	for rows.Next() {
+		var id, lastAt string
+		if err := rows.Scan(&id, &lastAt); err != nil {
+			return nil, fmt.Errorf("scan dialog summary: %w", err)
+		}
+		ids = append(ids, id)
+		lastAts = append(lastAts, lastAt)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	summaries := make([]DialogSummary, 0, len(ids))
+	for i, id := range ids {
+		firstQuestion, err := s.firstUserMessage(id)
+		if err != nil {
+			return nil, err
+		}
+		at, _ := time.Parse(time.RFC3339Nano, lastAts[i]) // zero time on parse failure: label degrades, doesn't fail
+		summaries = append(summaries, DialogSummary{ID: id, Label: formatDialogLabel(at, firstQuestion)})
+	}
+	return summaries, nil
+}
+
+func (s *Store) firstUserMessage(dialogID string) (string, error) {
+	var content string
+	err := s.db.QueryRow(
+		`SELECT content FROM dialog WHERE dialog_id = ? AND role = 'user' ORDER BY id LIMIT 1`, dialogID,
+	).Scan(&content)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("load first question for dialog %s: %w", dialogID, err)
+	}
+	return content, nil
+}
+
+// formatDialogLabel builds a Step D select-list entry: a timestamp plus a
+// short excerpt of the dialog's opening question, e.g.
+// "14 Sep 15:04 — Сколько будет 6*7?".
+func formatDialogLabel(at time.Time, firstQuestion string) string {
+	stamp := at.Format("02 Jan 15:04")
+	if excerpt := truncateExcerpt(firstQuestion, 50); excerpt != "" {
+		return stamp + " — " + excerpt
+	}
+	return stamp
+}
+
+// truncateExcerpt collapses s to a single line and caps it at maxRunes.
+func truncateExcerpt(s string, maxRunes int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	r := []rune(s)
+	if len(r) <= maxRunes {
+		return s
+	}
+	return string(r[:maxRunes]) + "…"
 }
 
 // Close closes the underlying database.

@@ -4,7 +4,7 @@ kimi-k2.6
 ### System Prompt
 
 ### User Prompt
-Меня зовут - федя, мне - 41 год.  
+В каком году мне исполнится 50 лет? 
 
 ### Response format
 
