@@ -117,7 +117,7 @@ func isNewDialogCommand(extra string) bool {
 // (CLAUDE.md's "## Диалоги" and "Шаг D"). It sends exactly one
 // dialogResult to resultCh before returning.
 func runDialog(ctx context.Context, cfg *config.Config, store *dialogstore.Store, masker *secretmask.Masker, stdin *os.File, reader *bufio.Reader, stdout io.Writer, opts Options, resultCh chan<- dialogResult) {
-	dialogID, dialogContext, dialogPromptTotal, dialogCompletionTotal, ok := selectDialog(store, stdin, reader, stdout)
+	dialogID, dialogContext, dialogPromptTotal, dialogCompletionTotal, ok := selectDialog(ctx, cfg, store, stdin, reader, stdout)
 	if !ok {
 		resultCh <- dialogResult{}
 		return
@@ -238,12 +238,12 @@ func runDialog(ctx context.Context, cfg *config.Config, store *dialogstore.Store
 		if store != nil {
 			promptTokens := ex.PromptTokens
 			for _, m := range turnMessages {
-				if err := store.AppendMessage(dialogID, m.Role, m.Content, &promptTokens, nil); err != nil {
+				if err := store.AppendMessage(dialogID, m.Role, m.Content, model, &promptTokens, nil); err != nil {
 					fmt.Fprintln(stdout, "не удалось сохранить сообщение диалога:", err)
 				}
 			}
 			completionTokens := ex.CompletionTokens
-			if err := store.AppendMessage(dialogID, "assistant", content, nil, &completionTokens); err != nil {
+			if err := store.AppendMessage(dialogID, "assistant", content, model, nil, &completionTokens); err != nil {
 				fmt.Fprintln(stdout, "не удалось сохранить сообщение диалога:", err)
 			}
 		}
@@ -256,12 +256,14 @@ func runDialog(ctx context.Context, cfg *config.Config, store *dialogstore.Store
 
 // selectDialog runs Step D: pick "/new" to start a fresh dialog, or an
 // existing one to resume it. Resuming prints its last two Q&A pairs (per
-// CLAUDE.md) and returns its full history folded into one system-prompt
-// context string (see appendDialogContext), plus that history's summed
-// prompt_tokens/completion_tokens to seed the running "dialog
-// prompt_tokens"/"dialog completion_tokens" totals. ok is false when the
-// operator exited (Ctrl+D, "exit"/"quit", or "q").
-func selectDialog(store *dialogstore.Store, stdin *os.File, reader *bufio.Reader, stdout io.Writer) (dialogID, dialogContext string, promptTotal, completionTotal int, ok bool) {
+// CLAUDE.md) and returns a system-prompt context string built from its
+// saved summary (if any — CLAUDE.md: "если для диалога существует summary
+// ... его также необходимо добавить к system prompt") plus its most recent
+// turns (see enforceHistoryLimit and appendDialogContext), along with the
+// full history's summed prompt_tokens/completion_tokens to seed the
+// running "dialog prompt_tokens"/"dialog completion_tokens" totals. ok is
+// false when the operator exited (Ctrl+D, "exit"/"quit", or "q").
+func selectDialog(ctx context.Context, cfg *config.Config, store *dialogstore.Store, stdin *os.File, reader *bufio.Reader, stdout io.Writer) (dialogID, dialogContext string, promptTotal, completionTotal int, ok bool) {
 	var summaries []dialogstore.DialogSummary
 	if store != nil {
 		var err error
@@ -299,8 +301,10 @@ func selectDialog(store *dialogstore.Store, stdin *os.File, reader *bufio.Reader
 
 	printRecentHistory(stdout, history, 2)
 
+	// The dialog's lifetime token totals cover its whole persisted
+	// history, independent of how much of that history stays "active"
+	// context below.
 	for _, m := range history {
-		appendDialogContext(&dialogContext, m.Role, m.Content)
 		if m.PromptTokens != nil {
 			promptTotal += *m.PromptTokens
 		}
@@ -308,6 +312,24 @@ func selectDialog(store *dialogstore.Store, stdin *os.File, reader *bufio.Reader
 			completionTotal += *m.CompletionTokens
 		}
 	}
+
+	summary, kept := enforceHistoryLimit(ctx, cfg, store, id, history, stdout)
+	var turnsContext string
+	for _, t := range kept {
+		for _, m := range t.request {
+			appendDialogContext(&turnsContext, m.Role, m.Content)
+		}
+		appendDialogContext(&turnsContext, "assistant", t.reply.Content)
+	}
+	switch {
+	case summary != "" && turnsContext != "":
+		dialogContext = "Summary предыдущего диалога:\n" + summary + "\n\n" + turnsContext
+	case summary != "":
+		dialogContext = "Summary предыдущего диалога:\n" + summary
+	default:
+		dialogContext = turnsContext
+	}
+
 	return id, dialogContext, promptTotal, completionTotal, true
 }
 

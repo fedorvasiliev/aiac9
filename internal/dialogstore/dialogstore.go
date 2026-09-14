@@ -42,13 +42,19 @@ CREATE TABLE IF NOT EXISTS dialog (
 	dialog_id         TEXT NOT NULL,
 	role              TEXT NOT NULL,
 	content           TEXT NOT NULL,
+	model             TEXT,
 	prompt_tokens     INTEGER,
 	completion_tokens INTEGER,
 	created_at        DATETIME NOT NULL
+);
+CREATE TABLE IF NOT EXISTS dialog_summary (
+	dialog_id  TEXT PRIMARY KEY,
+	summary    TEXT NOT NULL,
+	updated_at DATETIME NOT NULL
 );`
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("create dialog table: %w", err)
+		return nil, fmt.Errorf("create dialog tables: %w", err)
 	}
 
 	// Best-effort upgrade for a database file created before these columns
@@ -58,6 +64,7 @@ CREATE TABLE IF NOT EXISTS dialog (
 	for _, stmt := range []string{
 		`ALTER TABLE dialog ADD COLUMN prompt_tokens INTEGER`,
 		`ALTER TABLE dialog ADD COLUMN completion_tokens INTEGER`,
+		`ALTER TABLE dialog ADD COLUMN model TEXT`,
 	} {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			db.Close()
@@ -71,16 +78,20 @@ CREATE TABLE IF NOT EXISTS dialog (
 // AppendMessage records one dialog message: dialogID groups every message
 // of the same conversation together, role/content mirror the LLM chat
 // message they came from ("system"/"user"/"assistant" and message.content).
-// promptTokens/completionTokens are nil unless known — CLAUDE.md: "prompt_tokens"
-// в строчку с запросом и "completion_tokens" в строчку с ответом", so
-// callers pass promptTokens for a turn's request-side messages (system/user)
-// and completionTokens for its assistant reply, leaving the other nil.
-func (s *Store) AppendMessage(dialogID, role, content string, promptTokens, completionTokens *int) error {
+// model is the model this turn was sent to — CLAUDE.md's "Работа с
+// историей диалогов" reuses "последней использованной модели" of a
+// dialog when summarizing it, so every row records which model its turn
+// used. promptTokens/completionTokens are nil unless known — CLAUDE.md:
+// "prompt_tokens" в строчку с запросом и "completion_tokens" в строчку с
+// ответом", so callers pass promptTokens for a turn's request-side
+// messages (system/user) and completionTokens for its assistant reply,
+// leaving the other nil.
+func (s *Store) AppendMessage(dialogID, role, content, model string, promptTokens, completionTokens *int) error {
 	_, err := s.db.Exec(
-		`INSERT INTO dialog (dialog_id, role, content, prompt_tokens, completion_tokens, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO dialog (dialog_id, role, content, model, prompt_tokens, completion_tokens, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		// Stored as text (not a driver-specific time.Time encoding) so it
 		// round-trips predictably regardless of SQL driver quirks.
-		dialogID, role, content, promptTokens, completionTokens, time.Now().Format(time.RFC3339Nano),
+		dialogID, role, content, model, promptTokens, completionTokens, time.Now().Format(time.RFC3339Nano),
 	)
 	if err != nil {
 		return fmt.Errorf("insert dialog message: %w", err)
@@ -90,16 +101,18 @@ func (s *Store) AppendMessage(dialogID, role, content string, promptTokens, comp
 
 // Message is one persisted dialog message, as returned by History.
 type Message struct {
+	ID               int64 // the dialog table's row id, for DeleteMessages
 	Role             string
 	Content          string
-	PromptTokens     *int // nil unless this row recorded a request's prompt_tokens
-	CompletionTokens *int // nil unless this row recorded a response's completion_tokens
+	Model            string // the model this row's turn was sent to
+	PromptTokens     *int   // nil unless this row recorded a request's prompt_tokens
+	CompletionTokens *int   // nil unless this row recorded a response's completion_tokens
 }
 
 // History returns every message of dialogID, oldest first.
 func (s *Store) History(dialogID string) ([]Message, error) {
 	rows, err := s.db.Query(
-		`SELECT role, content, prompt_tokens, completion_tokens FROM dialog WHERE dialog_id = ? ORDER BY id`, dialogID,
+		`SELECT id, role, content, model, prompt_tokens, completion_tokens FROM dialog WHERE dialog_id = ? ORDER BY id`, dialogID,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("query dialog history: %w", err)
@@ -109,10 +122,12 @@ func (s *Store) History(dialogID string) ([]Message, error) {
 	var history []Message
 	for rows.Next() {
 		var m Message
+		var model sql.NullString
 		var promptTokens, completionTokens sql.NullInt64
-		if err := rows.Scan(&m.Role, &m.Content, &promptTokens, &completionTokens); err != nil {
+		if err := rows.Scan(&m.ID, &m.Role, &m.Content, &model, &promptTokens, &completionTokens); err != nil {
 			return nil, fmt.Errorf("scan dialog message: %w", err)
 		}
+		m.Model = model.String
 		if promptTokens.Valid {
 			v := int(promptTokens.Int64)
 			m.PromptTokens = &v
@@ -124,6 +139,53 @@ func (s *Store) History(dialogID string) ([]Message, error) {
 		history = append(history, m)
 	}
 	return history, rows.Err()
+}
+
+// DeleteMessages permanently removes the given rows from the dialog table
+// — CLAUDE.md's "Работа с историей диалогов": once turns older than
+// HISTORY_MSG_COUNT are folded into dialog_summary, they're deleted here.
+// A nil/empty ids is a no-op.
+func (s *Store) DeleteMessages(ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	if _, err := s.db.Exec(`DELETE FROM dialog WHERE id IN (`+placeholders+`)`, args...); err != nil {
+		return fmt.Errorf("delete dialog messages: %w", err)
+	}
+	return nil
+}
+
+// Summary returns dialogID's saved summary, or "" if it has none.
+func (s *Store) Summary(dialogID string) (string, error) {
+	var summary string
+	err := s.db.QueryRow(`SELECT summary FROM dialog_summary WHERE dialog_id = ?`, dialogID).Scan(&summary)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("load dialog summary: %w", err)
+	}
+	return summary, nil
+}
+
+// SetSummary creates or overwrites dialogID's saved summary — CLAUDE.md:
+// "Получившееся summary необходимо сохранить в dialog_summary обновив
+// соответствующую диалогу строчку."
+func (s *Store) SetSummary(dialogID, summary string) error {
+	_, err := s.db.Exec(
+		`INSERT INTO dialog_summary (dialog_id, summary, updated_at) VALUES (?, ?, ?)
+		 ON CONFLICT(dialog_id) DO UPDATE SET summary = excluded.summary, updated_at = excluded.updated_at`,
+		dialogID, summary, time.Now().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("save dialog summary: %w", err)
+	}
+	return nil
 }
 
 // DialogSummary identifies one existing dialog for Step D's selection list

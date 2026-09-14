@@ -1,7 +1,22 @@
-// Package config loads application configuration from the environment.
+// Package config loads application configuration from a config file and
+// environment variables.
 package config
 
-import "os"
+import (
+	"os"
+	"strconv"
+	"strings"
+)
+
+// FilePath is the config file Load reads, relative to the working
+// directory — CLAUDE.md: "конфигурационный файл ./aiac9.config".
+const FilePath = "aiac9.config"
+
+// defaultHistoryMsgCount is used when HISTORY_MSG_COUNT is unset in both
+// the environment and the config file. CLAUDE.md doesn't specify a
+// default, so a modest value is picked to keep a live dialog's context
+// bounded without needing summarization to kick in on ordinary use.
+const defaultHistoryMsgCount = 20
 
 // Config holds runtime configuration for the application.
 type Config struct {
@@ -27,25 +42,107 @@ type Config struct {
 	// DeepSeekBaseURL overrides internal/deepseek's default API endpoint,
 	// same purpose as MoonshotBaseURL.
 	DeepSeekBaseURL string
+
+	// HistoryMsgCount is how many of a dialog's most recent request/
+	// response turns stay "active" context on Step D — CLAUDE.md's
+	// "Работа с историей диалогов". Older turns are either summarized
+	// (see HistorySummarization) or simply left out of the context.
+	HistoryMsgCount int
+
+	// HistorySummarization enables folding turns older than
+	// HistoryMsgCount into a per-dialog summary (table dialog_summary)
+	// via an LLM call, then deleting them from the dialog table. Off by
+	// default — CLAUDE.md phrases it as an opt-in feature ("если ...
+	// включена").
+	HistorySummarization bool
 }
 
-// Load reads configuration from environment variables, falling back to
-// sensible defaults for local development.
+// Load reads configuration from ./aiac9.config (if present) and
+// environment variables, falling back to sensible defaults for local
+// development. Environment variables always win over the config file —
+// CLAUDE.md: "переменные окружения — перезаписывают значения из файла".
 func Load() (*Config, error) {
+	fileValues, err := loadFile(FilePath)
+	if err != nil {
+		return nil, err
+	}
+
 	cfg := &Config{
-		Addr:            getEnv("ADDR", ":8080"),
-		Env:             getEnv("APP_ENV", "development"),
-		MoonshotAPIKey:  os.Getenv("MOONSHOT_API_KEY"),
-		MoonshotBaseURL: os.Getenv("MOONSHOT_BASE_URL"),
-		DeepSeekAPIKey:  os.Getenv("DEEPSEEK_API_KEY"),
-		DeepSeekBaseURL: os.Getenv("DEEPSEEK_BASE_URL"),
+		Addr:                 getValue(fileValues, "ADDR", ":8080"),
+		Env:                  getValue(fileValues, "APP_ENV", "development"),
+		MoonshotAPIKey:       getValue(fileValues, "MOONSHOT_API_KEY", ""),
+		MoonshotBaseURL:      getValue(fileValues, "MOONSHOT_BASE_URL", ""),
+		DeepSeekAPIKey:       getValue(fileValues, "DEEPSEEK_API_KEY", ""),
+		DeepSeekBaseURL:      getValue(fileValues, "DEEPSEEK_BASE_URL", ""),
+		HistoryMsgCount:      getIntValue(fileValues, "HISTORY_MSG_COUNT", defaultHistoryMsgCount),
+		HistorySummarization: getBoolValue(fileValues, "HISTORY_SUMMARIZATION", false),
 	}
 	return cfg, nil
 }
 
-func getEnv(key, fallback string) string {
+// loadFile parses simple "KEY=VALUE" lines from path (blank lines and
+// lines starting with "#" are skipped). A missing file is not an error —
+// it yields an empty map, since the config file itself is optional.
+func loadFile(path string) (map[string]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return map[string]string{}, nil
+		}
+		return nil, err
+	}
+
+	values := make(map[string]string)
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		values[strings.TrimSpace(key)] = strings.TrimSpace(value)
+	}
+	return values, nil
+}
+
+// getValue resolves key from the environment first, then fileValues, then
+// fallback.
+func getValue(fileValues map[string]string, key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
 	}
+	if v, ok := fileValues[key]; ok && v != "" {
+		return v
+	}
 	return fallback
+}
+
+// getIntValue is getValue, parsed as an integer; an unparsable value falls
+// back the same as an absent one.
+func getIntValue(fileValues map[string]string, key string, fallback int) int {
+	v := getValue(fileValues, key, "")
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return fallback
+	}
+	return n
+}
+
+// getBoolValue is getValue, parsed per CLAUDE.md's convention: "on"/"1"/
+// "yes" is true, "off"/"0"/"no" is false (case-insensitive); anything else
+// (including absent) falls back to fallback.
+func getBoolValue(fileValues map[string]string, key string, fallback bool) bool {
+	switch strings.ToLower(strings.TrimSpace(getValue(fileValues, key, ""))) {
+	case "on", "1", "yes":
+		return true
+	case "off", "0", "no":
+		return false
+	default:
+		return fallback
+	}
 }

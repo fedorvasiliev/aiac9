@@ -2,6 +2,7 @@
 /logs/
 *.log
 .env
+/aiac9.config
 .DS_Store
 tmp.md
 .idea/
