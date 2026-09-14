@@ -88,17 +88,27 @@ func lastUsedModel(history []dialogstore.Message) string {
 	return defaultModel
 }
 
+// strategyHardDeletesOverflow reports whether cfg's ContextStrategy trims
+// a dialog by outright deleting turns past HistoryMsgCount rather than
+// (optionally) summarizing them first — CLAUDE.md's "### Context
+// Strategy": true for both "Sliding_Window" and "STICKY_FACTS".
+func strategyHardDeletesOverflow(strategy string) bool {
+	return strings.EqualFold(strategy, config.ContextStrategySlidingWindow) ||
+		strings.EqualFold(strategy, config.ContextStrategyStickyFacts)
+}
+
 // enforceHistoryLimit keeps at most cfg.HistoryMsgCount of dialogID's most
 // recent turns "active" — CLAUDE.md's "Работа с историей диалогов": "Для
 // каждого диалога храним последние <HISTORY_MSG_COUNT> запросов и столько
 // же соответствующих ответов". summary is the dialog's saved summary
 // (loaded from dialog_summary; "" if it has none). When
-// cfg.HistorySummarization is on, turns older than the limit are folded
-// into summary one at a time via the LLM and deleted from ./aiac9.db, so
-// dialog_summary and the returned summary stay in sync with each other;
-// when it's off, older turns are left in the database untouched but simply
-// excluded from kept. kept is always capped to the newest
-// cfg.HistoryMsgCount turns.
+// cfg.HistorySummarization is on (and ContextStrategy is neither
+// Sliding_Window nor STICKY_FACTS — see strategyHardDeletesOverflow), turns
+// older than the limit are folded into summary one at a time via the LLM
+// and deleted from ./aiac9.db, so dialog_summary and the returned summary
+// stay in sync with each other; when it's off, older turns are left in the
+// database untouched but simply excluded from kept. kept is always capped
+// to the newest cfg.HistoryMsgCount turns.
 func enforceHistoryLimit(ctx context.Context, cfg *config.Config, store *dialogstore.Store, dialogID string, history []dialogstore.Message, stdout io.Writer) (summary string, kept []turn) {
 	turns := groupIntoTurns(history)
 
@@ -118,6 +128,22 @@ func enforceHistoryLimit(ctx context.Context, cfg *config.Config, store *dialogs
 
 	overflow := turns[:len(turns)-cfg.HistoryMsgCount]
 	kept = turns[len(turns)-cfg.HistoryMsgCount:]
+
+	// CLAUDE.md's "### Context Strategy": both Sliding_Window and
+	// STICKY_FACTS hard-delete everything past the cap, no summarization
+	// involved — takes priority over HistorySummarization when either is
+	// explicitly selected. STICKY_FACTS additionally keeps its own
+	// per-dialog facts (see facts.go), independent of this trimming.
+	if strategyHardDeletesOverflow(cfg.ContextStrategy) {
+		if store != nil {
+			for _, t := range overflow {
+				if err := store.DeleteMessages(t.messageIDs()); err != nil {
+					fmt.Fprintln(stdout, "не удалось удалить старые сообщения диалога:", err)
+				}
+			}
+		}
+		return summary, kept
+	}
 
 	if !cfg.HistorySummarization || store == nil {
 		return summary, kept

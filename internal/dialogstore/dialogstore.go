@@ -51,6 +51,13 @@ CREATE TABLE IF NOT EXISTS dialog_summary (
 	dialog_id  TEXT PRIMARY KEY,
 	summary    TEXT NOT NULL,
 	updated_at DATETIME NOT NULL
+);
+CREATE TABLE IF NOT EXISTS facts (
+	dialog_id  TEXT NOT NULL,
+	key        TEXT NOT NULL,
+	value      TEXT NOT NULL,
+	updated_at DATETIME NOT NULL,
+	PRIMARY KEY (dialog_id, key)
 );`
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
@@ -186,6 +193,46 @@ func (s *Store) SetSummary(dialogID, summary string) error {
 		return fmt.Errorf("save dialog summary: %w", err)
 	}
 	return nil
+}
+
+// Fact is one persisted key/value fact for a dialog — CLAUDE.md's Context
+// Strategy "STICKY_FACTS".
+type Fact struct {
+	Key   string
+	Value string
+}
+
+// SetFact creates or overwrites one (dialogID, key) fact — CLAUDE.md:
+// "Секцию фактов из ответа необходимо сохранить в таблицу facts."
+func (s *Store) SetFact(dialogID, key, value string) error {
+	_, err := s.db.Exec(
+		`INSERT INTO facts (dialog_id, key, value, updated_at) VALUES (?, ?, ?, ?)
+		 ON CONFLICT(dialog_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+		dialogID, key, value, time.Now().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("save fact: %w", err)
+	}
+	return nil
+}
+
+// Facts returns every fact saved for dialogID, ordered by key.
+func (s *Store) Facts(dialogID string) ([]Fact, error) {
+	rows, err := s.db.Query(`SELECT key, value FROM facts WHERE dialog_id = ? ORDER BY key`, dialogID)
+	if err != nil {
+		return nil, fmt.Errorf("query facts: %w", err)
+	}
+	defer rows.Close()
+
+	var facts []Fact
+	for rows.Next() {
+		var f Fact
+		if err := rows.Scan(&f.Key, &f.Value); err != nil {
+			return nil, fmt.Errorf("scan fact: %w", err)
+		}
+		facts = append(facts, f)
+	}
+	return facts, rows.Err()
 }
 
 // DialogSummary identifies one existing dialog for Step D's selection list

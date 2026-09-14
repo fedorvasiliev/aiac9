@@ -286,6 +286,100 @@ func TestRun_ClearCommandResetsDialogHistory(t *testing.T) {
 	}
 }
 
+func TestRun_StickyFactsExtractsAndPersistsFacts(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	var gotBodies [][]byte
+	responses := []string{
+		`{"choices":[{"message":{"role":"assistant","content":"Привет, Федя!\n\nФакты:\nимя: Федя"}}]}`,
+		`{"choices":[{"message":{"role":"assistant","content":"Тебе 41."}}]}`,
+	}
+	i := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		gotBodies = append(gotBodies, body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(responses[i]))
+		i++
+	}))
+	defer server.Close()
+
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	defer pr.Close()
+
+	go func() {
+		defer pw.Close()
+		pw.Write([]byte("\n"))                 // Step D default
+		pw.Write([]byte("\n"))                 // Step A turn 1
+		pw.Write([]byte("меня зовут Федя\n"))  // Step T turn 1
+		pw.Write([]byte("\n"))                 // Step A turn 2
+		pw.Write([]byte("сколько мне лет?\n")) // Step T turn 2
+	}()
+
+	cfg := &config.Config{
+		MoonshotAPIKey:  "secret",
+		MoonshotBaseURL: server.URL,
+		ContextStrategy: "STICKY_FACTS",
+	}
+	var out bytes.Buffer
+	if err := Run(context.Background(), cfg, pr, &out, Options{}); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+
+	got := out.String()
+	if !strings.Contains(got, "Привет, Федя!") {
+		t.Fatalf("expected the reply's body (facts section stripped) to be printed, got:\n%s", got)
+	}
+	if strings.Contains(got, "Факты:") {
+		t.Fatalf("expected the facts section to be stripped from the printed reply, got:\n%s", got)
+	}
+
+	if len(gotBodies) != 2 {
+		t.Fatalf("got %d requests, want 2", len(gotBodies))
+	}
+	var req2 struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(gotBodies[1], &req2); err != nil {
+		t.Fatalf("decode second request: %v", err)
+	}
+
+	var sawFactsContext, sawFactsInstruction bool
+	for _, m := range req2.Messages {
+		if m.Role == "system" && strings.Contains(m.Content, "имя: Федя") {
+			sawFactsContext = true
+		}
+		if m.Role == "system" && strings.Contains(m.Content, "Факты:") {
+			sawFactsInstruction = true
+		}
+	}
+	if !sawFactsContext {
+		t.Fatalf("expected the second request to include the extracted fact as system context, got messages: %+v", req2.Messages)
+	}
+	if !sawFactsInstruction {
+		t.Fatalf("expected every request to include the facts-extraction instruction, got messages: %+v", req2.Messages)
+	}
+
+	db, err := sql.Open("sqlite", dialogstore.DefaultPath)
+	if err != nil {
+		t.Fatalf("open dialog db: %v", err)
+	}
+	defer db.Close()
+	var value string
+	if err := db.QueryRow(`SELECT value FROM facts WHERE key = 'имя'`).Scan(&value); err != nil {
+		t.Fatalf("query saved fact: %v", err)
+	}
+	if value != "Федя" {
+		t.Fatalf("saved fact value = %q, want %q", value, "Федя")
+	}
+}
+
 func TestRun_PersistsMessagesToDialogStore(t *testing.T) {
 	t.Chdir(t.TempDir())
 

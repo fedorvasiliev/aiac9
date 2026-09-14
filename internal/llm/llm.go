@@ -21,7 +21,7 @@ import (
 // response.
 const (
 	connectTimeout  = 30 * time.Second
-	responseTimeout = 120 * time.Second
+	responseTimeout = 180 * time.Second
 )
 
 // Message is one chat turn, OpenAI-compatible ("system"/"user"/"assistant").

@@ -178,14 +178,27 @@ func runDialog(ctx context.Context, cfg *config.Config, store *dialogstore.Store
 			client.HTTPClient.Timeout = *opts.ResponseTimeout
 		}
 
+		stickyFacts := strings.EqualFold(cfg.ContextStrategy, config.ContextStrategyStickyFacts)
+
 		// The dialog's history so far is folded into one system message
 		// (CLAUDE.md's Step D: "обогатить ей system prompt"), ahead of
-		// this turn's own messages.
-		fullMessages := make([]llm.Message, 0, len(turnMessages)+1)
+		// this turn's own messages. CONTEXT_STRATEGY=STICKY_FACTS adds a
+		// system message of previously extracted facts too, plus an
+		// instruction (after the turn's own messages) telling the model to
+		// extract new facts into a dedicated section of its reply.
+		fullMessages := make([]llm.Message, 0, len(turnMessages)+3)
+		if stickyFacts {
+			if fc := factsContext(store, dialogID, stdout); fc != "" {
+				fullMessages = append(fullMessages, llm.Message{Role: "system", Content: fc})
+			}
+		}
 		if dialogContext != "" {
 			fullMessages = append(fullMessages, llm.Message{Role: "system", Content: dialogContext})
 		}
 		fullMessages = append(fullMessages, turnMessages...)
+		if stickyFacts {
+			fullMessages = append(fullMessages, llm.Message{Role: "system", Content: factsInstruction})
+		}
 
 		// The request must be logged right before it is sent (CLAUDE.md),
 		// not only once the response comes back — so the log file is
@@ -212,6 +225,14 @@ func runDialog(ctx context.Context, cfg *config.Config, store *dialogstore.Store
 				return
 			}
 			continue
+		}
+
+		if stickyFacts {
+			var facts []dialogstore.Fact
+			content, facts = extractFacts(content)
+			if store != nil {
+				saveFacts(store, dialogID, facts, stdout)
+			}
 		}
 
 		fmt.Fprintln(stdout)

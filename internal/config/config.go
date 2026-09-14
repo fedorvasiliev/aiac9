@@ -55,7 +55,22 @@ type Config struct {
 	// default — CLAUDE.md phrases it as an opt-in feature ("если ...
 	// включена").
 	HistorySummarization bool
+
+	// ContextStrategy selects how a dialog's context is managed beyond
+	// the plain HistoryMsgCount/HistorySummarization behavior above —
+	// CLAUDE.md's "### Context Strategy". Empty means that plain
+	// behavior; see the ContextStrategy* constants for the recognized
+	// values ("Sliding_Window", "STICKY_FACTS"), matched
+	// case-insensitively.
+	ContextStrategy string
 }
+
+// Recognized ContextStrategy values (CLAUDE.md's own casing; compare
+// case-insensitively via strings.EqualFold, never by exact match).
+const (
+	ContextStrategySlidingWindow = "SLIDING_WINDOW"
+	ContextStrategyStickyFacts   = "STICKY_FACTS"
+)
 
 // Load reads configuration from ./aiac9.config (if present) and
 // environment variables, falling back to sensible defaults for local
@@ -76,6 +91,7 @@ func Load() (*Config, error) {
 		DeepSeekBaseURL:      getValue(fileValues, "DEEPSEEK_BASE_URL", ""),
 		HistoryMsgCount:      getIntValue(fileValues, "HISTORY_MSG_COUNT", defaultHistoryMsgCount),
 		HistorySummarization: getBoolValue(fileValues, "HISTORY_SUMMARIZATION", false),
+		ContextStrategy:      getValue(fileValues, "CONTEXT_STRATEGY", ""),
 	}
 	return cfg, nil
 }

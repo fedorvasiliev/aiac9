@@ -25,7 +25,7 @@ func TestLoad_DefaultsWhenNothingIsSet(t *testing.T) {
 
 func TestLoad_ReadsConfigFile(t *testing.T) {
 	t.Chdir(t.TempDir())
-	writeConfigFile(t, "ADDR=:9090\nHISTORY_MSG_COUNT=5\nHISTORY_SUMMARIZATION=on\n")
+	writeConfigFile(t, "ADDR=:9090\nHISTORY_MSG_COUNT=5\nHISTORY_SUMMARIZATION=on\nCONTEXT_STRATEGY=Sliding_Window\n")
 
 	cfg, err := Load()
 	if err != nil {
@@ -39,6 +39,21 @@ func TestLoad_ReadsConfigFile(t *testing.T) {
 	}
 	if !cfg.HistorySummarization {
 		t.Fatal("HistorySummarization = false, want true")
+	}
+	if cfg.ContextStrategy != "Sliding_Window" {
+		t.Fatalf("ContextStrategy = %q, want %q (as written, case preserved)", cfg.ContextStrategy, "Sliding_Window")
+	}
+}
+
+func TestLoad_ContextStrategyDefaultsToEmpty(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ContextStrategy != "" {
+		t.Fatalf("ContextStrategy = %q, want empty by default", cfg.ContextStrategy)
 	}
 }
 

@@ -54,7 +54,7 @@ func printUsage() {
 
 interactive mode flags:
   -f substr        only list ./prompts files whose name contains substr
-  -timeout seconds override the response timeout (default: 120s)`)
+  -timeout seconds override the response timeout (default: 180s)`)
 }
 
 func runInteractive(args []string) {

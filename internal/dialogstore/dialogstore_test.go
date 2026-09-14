@@ -343,6 +343,69 @@ func TestSummary_RoundTripsAndUpdatesInPlace(t *testing.T) {
 	}
 }
 
+func TestFacts_EmptyWhenNoneSaved(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	got, err := s.Facts("dlg-1")
+	if err != nil {
+		t.Fatalf("Facts: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("Facts (none saved) = %+v, want empty", got)
+	}
+}
+
+func TestSetFact_RoundTripsAndUpdatesInPlace(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	if err := s.SetFact("dlg-1", "имя", "Федя"); err != nil {
+		t.Fatalf("SetFact: %v", err)
+	}
+	if err := s.SetFact("dlg-1", "возраст", "41"); err != nil {
+		t.Fatalf("SetFact: %v", err)
+	}
+	if err := s.SetFact("dlg-2", "имя", "другой диалог"); err != nil {
+		t.Fatalf("SetFact (other dialog): %v", err)
+	}
+
+	got, err := s.Facts("dlg-1")
+	if err != nil {
+		t.Fatalf("Facts: %v", err)
+	}
+	want := []Fact{{Key: "возраст", Value: "41"}, {Key: "имя", Value: "Федя"}} // ordered by key
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("Facts(dlg-1) = %+v, want %+v", got, want)
+	}
+
+	// Updating an existing key overwrites in place rather than adding a
+	// second row.
+	if err := s.SetFact("dlg-1", "имя", "Фёдор"); err != nil {
+		t.Fatalf("SetFact (update): %v", err)
+	}
+	got, err = s.Facts("dlg-1")
+	if err != nil {
+		t.Fatalf("Facts (after update): %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("Facts(dlg-1) after update = %+v, want still 2 rows", got)
+	}
+	for _, f := range got {
+		if f.Key == "имя" && f.Value != "Фёдор" {
+			t.Fatalf("fact \"имя\" = %q, want it updated to %q", f.Value, "Фёдор")
+		}
+	}
+}
+
 func TestListDialogs_EmptyWhenNoMessages(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "test.db")
 	s, err := Open(path)

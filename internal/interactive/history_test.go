@@ -108,6 +108,127 @@ func TestEnforceHistoryLimit_UnderLimitKeepsEverything(t *testing.T) {
 	}
 }
 
+func TestEnforceHistoryLimit_SlidingWindowHardDeletesOverflowNoSummarization(t *testing.T) {
+	dir := t.TempDir()
+	store, err := dialogstore.Open(dir + "/test.db")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+
+	var summarizationCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		summarizationCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"should not be called"}}]}`))
+	}))
+	defer server.Close()
+
+	for i := 0; i < 5; i++ {
+		store.AppendMessage("dlg-1", "user", "q", "kimi-k2.6", nil, nil)
+		store.AppendMessage("dlg-1", "assistant", "a", "kimi-k2.6", nil, nil)
+	}
+	history, err := store.History("dlg-1")
+	if err != nil {
+		t.Fatalf("History: %v", err)
+	}
+
+	var out bytes.Buffer
+	cfg := &config.Config{
+		HistoryMsgCount:      2,
+		ContextStrategy:      config.ContextStrategySlidingWindow,
+		HistorySummarization: true, // must be ignored: Sliding_Window never summarizes
+		MoonshotAPIKey:       "secret",
+		MoonshotBaseURL:      server.URL,
+	}
+	summary, kept := enforceHistoryLimit(context.Background(), cfg, store, "dlg-1", history, &out)
+
+	if summary != "" {
+		t.Fatalf("summary = %q, want empty (Sliding_Window never summarizes)", summary)
+	}
+	if len(kept) != 2 {
+		t.Fatalf("kept = %d turns, want 2 (the cap)", len(kept))
+	}
+	if summarizationCalls != 0 {
+		t.Fatalf("summarizationCalls = %d, want 0 (no LLM call for Sliding_Window)", summarizationCalls)
+	}
+
+	remaining, err := store.History("dlg-1")
+	if err != nil {
+		t.Fatalf("History (after): %v", err)
+	}
+	if len(remaining) != 4 { // 2 kept turns * 2 rows each
+		t.Fatalf("remaining rows = %d, want 4 (overflow hard-deleted)", len(remaining))
+	}
+}
+
+func TestEnforceHistoryLimit_StickyFactsAlsoHardDeletesOverflowNoSummarization(t *testing.T) {
+	dir := t.TempDir()
+	store, err := dialogstore.Open(dir + "/test.db")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+
+	var summarizationCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		summarizationCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"should not be called"}}]}`))
+	}))
+	defer server.Close()
+
+	for i := 0; i < 5; i++ {
+		store.AppendMessage("dlg-1", "user", "q", "kimi-k2.6", nil, nil)
+		store.AppendMessage("dlg-1", "assistant", "a", "kimi-k2.6", nil, nil)
+	}
+	history, err := store.History("dlg-1")
+	if err != nil {
+		t.Fatalf("History: %v", err)
+	}
+
+	var out bytes.Buffer
+	cfg := &config.Config{
+		HistoryMsgCount:      2,
+		ContextStrategy:      config.ContextStrategyStickyFacts,
+		HistorySummarization: true, // must be ignored, same as Sliding_Window
+		MoonshotAPIKey:       "secret",
+		MoonshotBaseURL:      server.URL,
+	}
+	summary, kept := enforceHistoryLimit(context.Background(), cfg, store, "dlg-1", history, &out)
+
+	if summary != "" {
+		t.Fatalf("summary = %q, want empty (STICKY_FACTS never summarizes)", summary)
+	}
+	if len(kept) != 2 {
+		t.Fatalf("kept = %d turns, want 2 (the cap)", len(kept))
+	}
+	if summarizationCalls != 0 {
+		t.Fatalf("summarizationCalls = %d, want 0 (no LLM call for STICKY_FACTS trimming)", summarizationCalls)
+	}
+
+	remaining, err := store.History("dlg-1")
+	if err != nil {
+		t.Fatalf("History (after): %v", err)
+	}
+	if len(remaining) != 4 { // 2 kept turns * 2 rows each
+		t.Fatalf("remaining rows = %d, want 4 (overflow hard-deleted)", len(remaining))
+	}
+}
+
+func TestEnforceHistoryLimit_SlidingWindowIsCaseInsensitive(t *testing.T) {
+	history := makeHistory(5)
+	var out bytes.Buffer
+
+	_, kept := enforceHistoryLimit(context.Background(), &config.Config{
+		HistoryMsgCount: 2,
+		ContextStrategy: "sliding_window", // lowercase, per CLAUDE.md's own inconsistent casing across sections
+	}, nil, "dlg-1", history, &out)
+	if len(kept) != 2 {
+		t.Fatalf("kept = %d turns, want 2", len(kept))
+	}
+}
+
 func TestEnforceHistoryLimit_OverLimitWithoutSummarizationJustTrims(t *testing.T) {
 	dir := t.TempDir()
 	store, err := dialogstore.Open(dir + "/test.db")
