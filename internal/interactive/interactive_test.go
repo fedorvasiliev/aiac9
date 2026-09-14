@@ -3,6 +3,7 @@ package interactive
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -15,11 +16,14 @@ import (
 	"time"
 
 	"github.com/fedorvasiliev/aiac9/internal/config"
+	"github.com/fedorvasiliev/aiac9/internal/dialogstore"
 	"github.com/fedorvasiliev/aiac9/internal/exchangelog"
 	"github.com/fedorvasiliev/aiac9/internal/promptfile"
 )
 
 func TestRun_ExitsCleanlyOnImmediateEOF(t *testing.T) {
+	t.Chdir(t.TempDir()) // isolate the dialog SQLite file this run opens
+
 	pr, pw, err := os.Pipe()
 	if err != nil {
 		t.Fatalf("os.Pipe: %v", err)
@@ -37,8 +41,10 @@ func TestRun_ExitsCleanlyOnImmediateEOF(t *testing.T) {
 }
 
 func TestRun_ReportsMissingAPIKeyAndLoopsBackToSelect(t *testing.T) {
-	// No ./prompts directory here (t.Chdir isn't used), so Step A only
-	// offers the synthetic "no prompt" option.
+	// Isolate the dialog SQLite file this run opens; the fresh temp dir
+	// also has no ./prompts, so Step A only offers "no prompt".
+	t.Chdir(t.TempDir())
+
 	pr, pw, err := os.Pipe()
 	if err != nil {
 		t.Fatalf("os.Pipe: %v", err)
@@ -64,6 +70,8 @@ func TestRun_ReportsMissingAPIKeyAndLoopsBackToSelect(t *testing.T) {
 }
 
 func TestRun_NoPromptUsesDefaultModel(t *testing.T) {
+	t.Chdir(t.TempDir()) // isolate the dialog SQLite file this run opens
+
 	var gotBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotBody, _ = io.ReadAll(r.Body)
@@ -102,6 +110,8 @@ func TestRun_NoPromptUsesDefaultModel(t *testing.T) {
 }
 
 func TestRun_PrintsTotalTokensAndDuration(t *testing.T) {
+	t.Chdir(t.TempDir()) // isolate the dialog SQLite file this run opens
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"hi"}}],"usage":{"total_tokens":42}}`))
@@ -139,6 +149,163 @@ func TestRun_PrintsTotalTokensAndDuration(t *testing.T) {
 	}
 }
 
+func TestRun_AccumulatesDialogHistoryAcrossTurns(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	var gotBodies [][]byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		gotBodies = append(gotBodies, body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"reply"}}]}`))
+	}))
+	defer server.Close()
+
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	defer pr.Close()
+
+	go func() {
+		defer pw.Close()
+		// Turn 1 ("first question"), then turn 2 ("second question") — no
+		// /clear/-new in between, so they belong to the same dialog.
+		pw.Write([]byte("\nfirst question\n\nsecond question\n"))
+	}()
+
+	cfg := &config.Config{MoonshotAPIKey: "secret", MoonshotBaseURL: server.URL}
+	var out bytes.Buffer
+	if err := Run(context.Background(), cfg, pr, &out, Options{}); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+
+	if len(gotBodies) != 2 {
+		t.Fatalf("got %d requests, want 2", len(gotBodies))
+	}
+
+	var req2 struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(gotBodies[1], &req2); err != nil {
+		t.Fatalf("decode second request: %v", err)
+	}
+	want := []string{"first question", "reply", "second question"}
+	if len(req2.Messages) != len(want) {
+		t.Fatalf("second request messages = %+v, want content %v", req2.Messages, want)
+	}
+	for i, w := range want {
+		if req2.Messages[i].Content != w {
+			t.Fatalf("second request messages = %+v, want content %v", req2.Messages, want)
+		}
+	}
+}
+
+func TestRun_ClearCommandResetsDialogHistory(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	var gotBodies [][]byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		gotBodies = append(gotBodies, body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"reply"}}]}`))
+	}))
+	defer server.Close()
+
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	defer pr.Close()
+
+	go func() {
+		defer pw.Close()
+		// Turn 1, then "/clear", then a turn in the fresh dialog.
+		pw.Write([]byte("\nfirst question\n\n/clear\n\nsecond question\n"))
+	}()
+
+	cfg := &config.Config{MoonshotAPIKey: "secret", MoonshotBaseURL: server.URL}
+	var out bytes.Buffer
+	if err := Run(context.Background(), cfg, pr, &out, Options{}); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+
+	if !strings.Contains(out.String(), "начат новый диалог") {
+		t.Fatalf("expected a confirmation that a new dialog started, got:\n%s", out.String())
+	}
+	if len(gotBodies) != 2 {
+		t.Fatalf("got %d requests, want 2", len(gotBodies))
+	}
+
+	var req2 struct {
+		Messages []struct {
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(gotBodies[1], &req2); err != nil {
+		t.Fatalf("decode second request: %v", err)
+	}
+	if len(req2.Messages) != 1 || req2.Messages[0].Content != "second question" {
+		t.Fatalf("expected /clear to reset history, second request messages = %+v", req2.Messages)
+	}
+}
+
+func TestRun_PersistsMessagesToDialogStore(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"reply"}}]}`))
+	}))
+	defer server.Close()
+
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	defer pr.Close()
+
+	go func() {
+		defer pw.Close()
+		pw.Write([]byte("\nhello\nexit\n"))
+	}()
+
+	cfg := &config.Config{MoonshotAPIKey: "secret", MoonshotBaseURL: server.URL}
+	var out bytes.Buffer
+	if err := Run(context.Background(), cfg, pr, &out, Options{}); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+
+	db, err := sql.Open("sqlite", dialogstore.DefaultPath)
+	if err != nil {
+		t.Fatalf("open dialog db: %v", err)
+	}
+	defer db.Close()
+
+	rows, err := db.Query(`SELECT role, content FROM dialog ORDER BY id`)
+	if err != nil {
+		t.Fatalf("query dialog table: %v", err)
+	}
+	defer rows.Close()
+
+	var got [][2]string
+	for rows.Next() {
+		var role, content string
+		if err := rows.Scan(&role, &content); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		got = append(got, [2]string{role, content})
+	}
+	want := [][2]string{{"user", "hello"}, {"assistant", "reply"}}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("dialog rows = %v, want %v", got, want)
+	}
+}
+
 func TestRun_PromptFilterRestrictsStepAList(t *testing.T) {
 	t.Chdir(t.TempDir())
 
@@ -173,6 +340,8 @@ func TestRun_PromptFilterRestrictsStepAList(t *testing.T) {
 }
 
 func TestRun_ResponseTimeoutOverride(t *testing.T) {
+	t.Chdir(t.TempDir()) // isolate the dialog SQLite file this run opens
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(200 * time.Millisecond)
 		w.Header().Set("Content-Type", "application/json")
