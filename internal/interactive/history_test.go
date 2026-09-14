@@ -125,8 +125,8 @@ func TestEnforceHistoryLimit_SlidingWindowHardDeletesOverflowNoSummarization(t *
 	defer server.Close()
 
 	for i := 0; i < 5; i++ {
-		store.AppendMessage("dlg-1", "user", "q", "kimi-k2.6", nil, nil)
-		store.AppendMessage("dlg-1", "assistant", "a", "kimi-k2.6", nil, nil)
+		store.AppendMessage("dlg-1", "user", "q", "kimi-k2.6", "", nil, nil)
+		store.AppendMessage("dlg-1", "assistant", "a", "kimi-k2.6", "", nil, nil)
 	}
 	history, err := store.History("dlg-1")
 	if err != nil {
@@ -179,8 +179,8 @@ func TestEnforceHistoryLimit_StickyFactsAlsoHardDeletesOverflowNoSummarization(t
 	defer server.Close()
 
 	for i := 0; i < 5; i++ {
-		store.AppendMessage("dlg-1", "user", "q", "kimi-k2.6", nil, nil)
-		store.AppendMessage("dlg-1", "assistant", "a", "kimi-k2.6", nil, nil)
+		store.AppendMessage("dlg-1", "user", "q", "kimi-k2.6", "", nil, nil)
+		store.AppendMessage("dlg-1", "assistant", "a", "kimi-k2.6", "", nil, nil)
 	}
 	history, err := store.History("dlg-1")
 	if err != nil {
@@ -239,9 +239,9 @@ func TestEnforceHistoryLimit_OverLimitWithoutSummarizationJustTrims(t *testing.T
 
 	for i := 0; i < 5; i++ {
 		promptTokens := 1
-		store.AppendMessage("dlg-1", "user", "q", "kimi-k2.6", &promptTokens, nil)
+		store.AppendMessage("dlg-1", "user", "q", "kimi-k2.6", "", &promptTokens, nil)
 		completionTokens := 1
-		store.AppendMessage("dlg-1", "assistant", "a", "kimi-k2.6", nil, &completionTokens)
+		store.AppendMessage("dlg-1", "assistant", "a", "kimi-k2.6", "", nil, &completionTokens)
 	}
 	history, err := store.History("dlg-1")
 	if err != nil {
@@ -316,8 +316,8 @@ func TestEnforceHistoryLimit_SummarizesWithDialogsLastUsedModelNotTheDefault(t *
 
 	// This dialog's turns all used a non-default model.
 	for i := 0; i < 5; i++ {
-		store.AppendMessage("dlg-1", "user", "q", "deepseek-chat", nil, nil)
-		store.AppendMessage("dlg-1", "assistant", "a", "deepseek-chat", nil, nil)
+		store.AppendMessage("dlg-1", "user", "q", "deepseek-chat", "", nil, nil)
+		store.AppendMessage("dlg-1", "assistant", "a", "deepseek-chat", "", nil, nil)
 	}
 	history, err := store.History("dlg-1")
 	if err != nil {
@@ -362,8 +362,8 @@ func TestEnforceHistoryLimit_OverLimitWithSummarizationFoldsAndDeletes(t *testin
 	defer server.Close()
 
 	for i := 0; i < 5; i++ {
-		store.AppendMessage("dlg-1", "user", "q", "kimi-k2.6", nil, nil)
-		store.AppendMessage("dlg-1", "assistant", "a", "kimi-k2.6", nil, nil)
+		store.AppendMessage("dlg-1", "user", "q", "kimi-k2.6", "", nil, nil)
+		store.AppendMessage("dlg-1", "assistant", "a", "kimi-k2.6", "", nil, nil)
 	}
 	history, err := store.History("dlg-1")
 	if err != nil {

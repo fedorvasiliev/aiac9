@@ -55,7 +55,7 @@ func TestOpen_UpgradesPreExistingDatabaseMissingTokenColumns(t *testing.T) {
 	defer s.Close()
 
 	promptTokens := 3
-	if err := s.AppendMessage("dlg-1", "user", "hello", "test-model", &promptTokens, nil); err != nil {
+	if err := s.AppendMessage("dlg-1", "user", "hello", "test-model", "", &promptTokens, nil); err != nil {
 		t.Fatalf("AppendMessage after upgrade: %v", err)
 	}
 	got, err := s.History("dlg-1")
@@ -75,13 +75,13 @@ func TestAppendMessage_StoresRowsUnderDialogID(t *testing.T) {
 	}
 	defer s.Close()
 
-	if err := s.AppendMessage("dlg-1", "user", "hello", "test-model", nil, nil); err != nil {
+	if err := s.AppendMessage("dlg-1", "user", "hello", "test-model", "", nil, nil); err != nil {
 		t.Fatalf("AppendMessage: %v", err)
 	}
-	if err := s.AppendMessage("dlg-1", "assistant", "hi there", "test-model", nil, nil); err != nil {
+	if err := s.AppendMessage("dlg-1", "assistant", "hi there", "test-model", "", nil, nil); err != nil {
 		t.Fatalf("AppendMessage: %v", err)
 	}
-	if err := s.AppendMessage("dlg-2", "user", "unrelated dialog", "test-model", nil, nil); err != nil {
+	if err := s.AppendMessage("dlg-2", "user", "unrelated dialog", "test-model", "", nil, nil); err != nil {
 		t.Fatalf("AppendMessage: %v", err)
 	}
 
@@ -122,9 +122,9 @@ func TestHistory_ReturnsOrderedMessagesForOneDialog(t *testing.T) {
 	}
 	defer s.Close()
 
-	s.AppendMessage("dlg-1", "user", "hello", "test-model", nil, nil)
-	s.AppendMessage("dlg-1", "assistant", "hi there", "test-model", nil, nil)
-	s.AppendMessage("dlg-2", "user", "unrelated", "test-model", nil, nil)
+	s.AppendMessage("dlg-1", "user", "hello", "test-model", "", nil, nil)
+	s.AppendMessage("dlg-1", "assistant", "hi there", "test-model", "", nil, nil)
+	s.AppendMessage("dlg-2", "user", "unrelated", "test-model", "", nil, nil)
 
 	got, err := s.History("dlg-1")
 	if err != nil {
@@ -156,10 +156,10 @@ func TestAppendMessage_PersistsPromptAndCompletionTokens(t *testing.T) {
 	completionTokens := 7
 	// CLAUDE.md: prompt_tokens on the request row, completion_tokens on
 	// the response row — the other left nil on each.
-	if err := s.AppendMessage("dlg-1", "user", "hello", "test-model", &promptTokens, nil); err != nil {
+	if err := s.AppendMessage("dlg-1", "user", "hello", "test-model", "", &promptTokens, nil); err != nil {
 		t.Fatalf("AppendMessage: %v", err)
 	}
-	if err := s.AppendMessage("dlg-1", "assistant", "hi there", "test-model", nil, &completionTokens); err != nil {
+	if err := s.AppendMessage("dlg-1", "assistant", "hi there", "test-model", "", nil, &completionTokens); err != nil {
 		t.Fatalf("AppendMessage: %v", err)
 	}
 
@@ -192,10 +192,10 @@ func TestAppendMessage_PersistsModel(t *testing.T) {
 	}
 	defer s.Close()
 
-	if err := s.AppendMessage("dlg-1", "user", "hello", "kimi-k2.6", nil, nil); err != nil {
+	if err := s.AppendMessage("dlg-1", "user", "hello", "kimi-k2.6", "", nil, nil); err != nil {
 		t.Fatalf("AppendMessage: %v", err)
 	}
-	if err := s.AppendMessage("dlg-1", "assistant", "hi there", "kimi-k2.6", nil, nil); err != nil {
+	if err := s.AppendMessage("dlg-1", "assistant", "hi there", "kimi-k2.6", "", nil, nil); err != nil {
 		t.Fatalf("AppendMessage: %v", err)
 	}
 
@@ -233,11 +233,11 @@ func TestListDialogs_OrdersByMostRecentAndIncludesExcerpt(t *testing.T) {
 	}
 	defer s.Close()
 
-	s.AppendMessage("dlg-old", "user", "old question", "test-model", nil, nil)
-	s.AppendMessage("dlg-old", "assistant", "old answer", "test-model", nil, nil)
+	s.AppendMessage("dlg-old", "user", "old question", "test-model", "", nil, nil)
+	s.AppendMessage("dlg-old", "assistant", "old answer", "test-model", "", nil, nil)
 	time.Sleep(10 * time.Millisecond) // ensure a distinct created_at ordering
-	s.AppendMessage("dlg-new", "user", "new question", "test-model", nil, nil)
-	s.AppendMessage("dlg-new", "assistant", "new answer", "test-model", nil, nil)
+	s.AppendMessage("dlg-new", "user", "new question", "test-model", "", nil, nil)
+	s.AppendMessage("dlg-new", "assistant", "new answer", "test-model", "", nil, nil)
 
 	got, err := s.ListDialogs()
 	if err != nil {
@@ -265,8 +265,8 @@ func TestDeleteMessages_RemovesOnlyGivenRows(t *testing.T) {
 	}
 	defer s.Close()
 
-	s.AppendMessage("dlg-1", "user", "keep me", "test-model", nil, nil)
-	s.AppendMessage("dlg-1", "user", "delete me", "test-model", nil, nil)
+	s.AppendMessage("dlg-1", "user", "keep me", "test-model", "", nil, nil)
+	s.AppendMessage("dlg-1", "user", "delete me", "test-model", "", nil, nil)
 
 	before, err := s.History("dlg-1")
 	if err != nil {
@@ -406,6 +406,96 @@ func TestSetFact_RoundTripsAndUpdatesInPlace(t *testing.T) {
 	}
 }
 
+func TestAppendMessage_PersistsParentID(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	if err := s.AppendMessage("branch-1", "user", "hello", "kimi-k2.6", "parent-1", nil, nil); err != nil {
+		t.Fatalf("AppendMessage: %v", err)
+	}
+
+	var parentID sql.NullString
+	if err := s.db.QueryRow(`SELECT parent_id FROM dialog WHERE dialog_id = 'branch-1'`).Scan(&parentID); err != nil {
+		t.Fatalf("query parent_id: %v", err)
+	}
+	if !parentID.Valid || parentID.String != "parent-1" {
+		t.Fatalf("parent_id = %+v, want valid \"parent-1\"", parentID)
+	}
+}
+
+func TestAppendMessage_EmptyParentIDStoresNull(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	if err := s.AppendMessage("dlg-1", "user", "hello", "kimi-k2.6", "", nil, nil); err != nil {
+		t.Fatalf("AppendMessage: %v", err)
+	}
+
+	var parentID sql.NullString
+	if err := s.db.QueryRow(`SELECT parent_id FROM dialog WHERE dialog_id = 'dlg-1'`).Scan(&parentID); err != nil {
+		t.Fatalf("query parent_id: %v", err)
+	}
+	if parentID.Valid {
+		t.Fatalf("parent_id = %+v, want NULL for an empty parentID", parentID)
+	}
+}
+
+func TestBranches_ReturnsOnlyDialogsForkedFromParent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	s.AppendMessage("parent", "user", "root question", "kimi-k2.6", "", nil, nil)
+	s.AppendMessage("branch-a", "user", "branch a question", "kimi-k2.6", "parent", nil, nil)
+	time.Sleep(10 * time.Millisecond)
+	s.AppendMessage("branch-b", "user", "branch b question", "kimi-k2.6", "parent", nil, nil)
+	s.AppendMessage("unrelated", "user", "not a branch of parent", "kimi-k2.6", "", nil, nil)
+
+	got, err := s.Branches("parent")
+	if err != nil {
+		t.Fatalf("Branches: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("Branches(parent) = %+v, want 2 branches", got)
+	}
+	if got[0].ID != "branch-b" { // most recently active first
+		t.Fatalf("Branches(parent)[0].ID = %q, want the most recently active branch %q", got[0].ID, "branch-b")
+	}
+	if got[1].ID != "branch-a" {
+		t.Fatalf("Branches(parent)[1].ID = %q, want %q", got[1].ID, "branch-a")
+	}
+}
+
+func TestBranches_EmptyForDialogWithNoBranches(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	s.AppendMessage("dlg-1", "user", "hello", "kimi-k2.6", "", nil, nil)
+
+	got, err := s.Branches("dlg-1")
+	if err != nil {
+		t.Fatalf("Branches: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("Branches(dlg-1) = %+v, want empty", got)
+	}
+}
+
 func TestListDialogs_EmptyWhenNoMessages(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "test.db")
 	s, err := Open(path)
@@ -440,7 +530,7 @@ func TestClose_ClosesUnderlyingDB(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if err := s.AppendMessage("dlg-1", "user", "hello", "test-model", nil, nil); err == nil {
+	if err := s.AppendMessage("dlg-1", "user", "hello", "test-model", "", nil, nil); err == nil {
 		t.Fatal("expected AppendMessage to fail on a closed store")
 	}
 }

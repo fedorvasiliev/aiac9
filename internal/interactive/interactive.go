@@ -41,6 +41,15 @@ const userPromptOption = "Пользовательский промпт"
 // "start a fresh dialog" per CLAUDE.md.
 const newDialogOption = "/new"
 
+// newBranchOption and continueOption are the CONTEXT_STRATEGY=Branching
+// sub-step's two built-in choices (CLAUDE.md's "### Context Strategy"),
+// offered after Step D resolves an existing dialog. newBranchOption is the
+// default.
+const (
+	newBranchOption = "/new-branch"
+	continueOption  = "/continue"
+)
+
 // Options are CLI-flag-driven overrides for Run (see internal/cli's
 // "-f"/"-timeout" flags).
 type Options struct {
@@ -117,11 +126,13 @@ func isNewDialogCommand(extra string) bool {
 // (CLAUDE.md's "## Диалоги" and "Шаг D"). It sends exactly one
 // dialogResult to resultCh before returning.
 func runDialog(ctx context.Context, cfg *config.Config, store *dialogstore.Store, masker *secretmask.Masker, stdin *os.File, reader *bufio.Reader, stdout io.Writer, opts Options, resultCh chan<- dialogResult) {
-	dialogID, dialogContext, dialogPromptTotal, dialogCompletionTotal, ok := selectDialog(ctx, cfg, store, stdin, reader, stdout)
-	if !ok {
+	sel := selectDialog(ctx, cfg, store, stdin, reader, stdout)
+	if !sel.ok {
 		resultCh <- dialogResult{}
 		return
 	}
+	dialogID, parentID, dialogContext := sel.id, sel.parentID, sel.context
+	dialogPromptTotal, dialogCompletionTotal := sel.promptTotal, sel.completionTotal
 
 	for {
 		if ctx.Err() != nil {
@@ -256,15 +267,18 @@ func runDialog(ctx context.Context, cfg *config.Config, store *dialogstore.Store
 		// This turn's messages plus the reply enrich the dialog's context
 		// for its next turn, and are persisted per CLAUDE.md — prompt_tokens
 		// on the request-side rows, completion_tokens on the reply's row.
+		// parentID is only non-empty for a freshly forked branch (see
+		// selectBranch), and is then stamped on every row of that branch,
+		// same as model.
 		if store != nil {
 			promptTokens := ex.PromptTokens
 			for _, m := range turnMessages {
-				if err := store.AppendMessage(dialogID, m.Role, m.Content, model, &promptTokens, nil); err != nil {
+				if err := store.AppendMessage(dialogID, m.Role, m.Content, model, parentID, &promptTokens, nil); err != nil {
 					fmt.Fprintln(stdout, "не удалось сохранить сообщение диалога:", err)
 				}
 			}
 			completionTokens := ex.CompletionTokens
-			if err := store.AppendMessage(dialogID, "assistant", content, model, nil, &completionTokens); err != nil {
+			if err := store.AppendMessage(dialogID, "assistant", content, model, parentID, nil, &completionTokens); err != nil {
 				fmt.Fprintln(stdout, "не удалось сохранить сообщение диалога:", err)
 			}
 		}
@@ -275,16 +289,27 @@ func runDialog(ctx context.Context, cfg *config.Config, store *dialogstore.Store
 	}
 }
 
+// dialogSelection is selectDialog's result.
+type dialogSelection struct {
+	id              string // the dialog_id future turns are written under
+	parentID        string // non-empty only for a freshly forked branch — CLAUDE.md's Branching
+	context         string
+	promptTotal     int
+	completionTotal int
+	ok              bool // false when the operator exited (Ctrl+D, "exit"/"quit", or "q")
+}
+
 // selectDialog runs Step D: pick "/new" to start a fresh dialog, or an
-// existing one to resume it. Resuming prints its last two Q&A pairs (per
-// CLAUDE.md) and returns a system-prompt context string built from its
-// saved summary (if any — CLAUDE.md: "если для диалога существует summary
-// ... его также необходимо добавить к system prompt") plus its most recent
-// turns (see enforceHistoryLimit and appendDialogContext), along with the
-// full history's summed prompt_tokens/completion_tokens to seed the
-// running "dialog prompt_tokens"/"dialog completion_tokens" totals. ok is
-// false when the operator exited (Ctrl+D, "exit"/"quit", or "q").
-func selectDialog(ctx context.Context, cfg *config.Config, store *dialogstore.Store, stdin *os.File, reader *bufio.Reader, stdout io.Writer) (dialogID, dialogContext string, promptTotal, completionTotal int, ok bool) {
+// existing one to resume it (possibly redirected by the
+// CONTEXT_STRATEGY=Branching sub-step — see selectBranch). Resuming prints
+// its last two Q&A pairs (per CLAUDE.md) and returns a system-prompt
+// context string built from its saved summary (if any — CLAUDE.md: "если
+// для диалога существует summary ... его также необходимо добавить к
+// system prompt") plus its most recent turns (see enforceHistoryLimit and
+// appendDialogContext), along with the full history's summed
+// prompt_tokens/completion_tokens to seed the running "dialog
+// prompt_tokens"/"dialog completion_tokens" totals.
+func selectDialog(ctx context.Context, cfg *config.Config, store *dialogstore.Store, stdin *os.File, reader *bufio.Reader, stdout io.Writer) dialogSelection {
 	var summaries []dialogstore.DialogSummary
 	if store != nil {
 		var err error
@@ -304,17 +329,28 @@ func selectDialog(ctx context.Context, cfg *config.Config, store *dialogstore.St
 
 	choice, selected := selectStep(stdin, reader, stdout, "Dialog", options, 0)
 	if !selected {
-		return "", "", 0, 0, false
+		return dialogSelection{}
 	}
 	if choice == newDialogOption {
-		return newDialogID(), "", 0, 0, true
+		return dialogSelection{id: newDialogID(), ok: true}
 	}
 
 	id := labelToID[choice]
+	historyID := id // whose history/summary/facts seed the context — differs from id only for a fresh branch fork
+	var parentID string
+
+	if strings.EqualFold(cfg.ContextStrategy, config.ContextStrategyBranching) {
+		writeID, hID, pID, ok := selectBranch(store, id, stdin, reader, stdout)
+		if !ok {
+			return dialogSelection{}
+		}
+		id, historyID, parentID = writeID, hID, pID
+	}
+
 	var history []dialogstore.Message
 	if store != nil {
 		var err error
-		history, err = store.History(id)
+		history, err = store.History(historyID)
 		if err != nil {
 			fmt.Fprintln(stdout, "не удалось загрузить историю диалога:", err)
 		}
@@ -325,6 +361,7 @@ func selectDialog(ctx context.Context, cfg *config.Config, store *dialogstore.St
 	// The dialog's lifetime token totals cover its whole persisted
 	// history, independent of how much of that history stays "active"
 	// context below.
+	var promptTotal, completionTotal int
 	for _, m := range history {
 		if m.PromptTokens != nil {
 			promptTotal += *m.PromptTokens
@@ -334,7 +371,7 @@ func selectDialog(ctx context.Context, cfg *config.Config, store *dialogstore.St
 		}
 	}
 
-	summary, kept := enforceHistoryLimit(ctx, cfg, store, id, history, stdout)
+	summary, kept := enforceHistoryLimit(ctx, cfg, store, historyID, history, stdout)
 	var turnsContext string
 	for _, t := range kept {
 		for _, m := range t.request {
@@ -342,6 +379,8 @@ func selectDialog(ctx context.Context, cfg *config.Config, store *dialogstore.St
 		}
 		appendDialogContext(&turnsContext, "assistant", t.reply.Content)
 	}
+
+	var dialogContext string
 	switch {
 	case summary != "" && turnsContext != "":
 		dialogContext = "Summary предыдущего диалога:\n" + summary + "\n\n" + turnsContext
@@ -351,7 +390,51 @@ func selectDialog(ctx context.Context, cfg *config.Config, store *dialogstore.St
 		dialogContext = turnsContext
 	}
 
-	return id, dialogContext, promptTotal, completionTotal, true
+	return dialogSelection{id: id, parentID: parentID, context: dialogContext, promptTotal: promptTotal, completionTotal: completionTotal, ok: true}
+}
+
+// selectBranch runs CONTEXT_STRATEGY=Branching's sub-step, shown after
+// Step D resolves an existing dialog (CLAUDE.md's "### Context Strategy"):
+// choose "/new-branch" (default) to fork it, "/continue" to keep working
+// in it unchanged, or jump directly into one of its existing branches if
+// it has any ("если у диалога есть ветки, их необходимо давать выбирать").
+//
+// writeID is the dialog_id future turns should be written under; historyID
+// is whose history/summary/facts should seed the context (equal to
+// dialogID unless writeID ended up being a different existing branch);
+// parentID is non-empty only when writeID is a brand-new forked branch
+// (dialogID itself), for AppendMessage to stamp on its rows.
+func selectBranch(store *dialogstore.Store, dialogID string, stdin *os.File, reader *bufio.Reader, stdout io.Writer) (writeID, historyID, parentID string, ok bool) {
+	var branches []dialogstore.DialogSummary
+	if store != nil {
+		var err error
+		branches, err = store.Branches(dialogID)
+		if err != nil {
+			fmt.Fprintln(stdout, "не удалось прочитать ветки диалога:", err)
+		}
+	}
+
+	options := make([]string, 0, len(branches)+2)
+	options = append(options, newBranchOption, continueOption)
+	labelToID := make(map[string]string, len(branches))
+	for _, b := range branches {
+		options = append(options, b.Label)
+		labelToID[b.Label] = b.ID
+	}
+
+	choice, selected := selectStep(stdin, reader, stdout, "Branch", options, 0)
+	if !selected {
+		return "", "", "", false
+	}
+	switch choice {
+	case newBranchOption:
+		return newDialogID(), dialogID, dialogID, true
+	case continueOption:
+		return dialogID, dialogID, "", true
+	default:
+		branchID := labelToID[choice]
+		return branchID, branchID, "", true
+	}
 }
 
 // appendDialogContext folds one more message into *ctx, in the same

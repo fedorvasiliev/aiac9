@@ -432,6 +432,194 @@ func TestRun_PersistsMessagesToDialogStore(t *testing.T) {
 	}
 }
 
+func TestRun_BranchingNewBranchForksAndInheritsParentContext(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"root reply"}}]}`))
+	}))
+	defer server.Close()
+	cfg := &config.Config{MoonshotAPIKey: "secret", MoonshotBaseURL: server.URL}
+
+	// First run: build the parent dialog (one turn), then exit.
+	pr1, pw1, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	go func() {
+		defer pw1.Close()
+		pw1.Write([]byte("\n"))              // Step D: default ("/new")
+		pw1.Write([]byte("\n"))              // Step A: default
+		pw1.Write([]byte("root question\n")) // Step T
+		pw1.Write([]byte("exit\n"))          // Step A, next turn: exit
+	}()
+	var out1 bytes.Buffer
+	if err := Run(context.Background(), cfg, pr1, &out1, Options{}); err != nil {
+		t.Fatalf("first Run returned error: %v", err)
+	}
+	pr1.Close()
+
+	// Second run: CONTEXT_STRATEGY=Branching, resume the parent, accept
+	// the default "/new-branch" at the branch sub-step.
+	var gotBody []byte
+	server2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"branch reply"}}]}`))
+	}))
+	defer server2.Close()
+	cfg2 := &config.Config{MoonshotAPIKey: "secret", MoonshotBaseURL: server2.URL, ContextStrategy: "Branching"}
+
+	pr2, pw2, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	defer pr2.Close()
+	go func() {
+		defer pw2.Close()
+		pw2.Write([]byte("2\n"))               // Step D: pick the parent dialog
+		pw2.Write([]byte("\n"))                // Branch step: default ("/new-branch")
+		pw2.Write([]byte("\n"))                // Step A: default
+		pw2.Write([]byte("branch question\n")) // Step T
+	}()
+
+	var out2 bytes.Buffer
+	if err := Run(context.Background(), cfg2, pr2, &out2, Options{}); err != nil {
+		t.Fatalf("second Run returned error: %v", err)
+	}
+
+	var req struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(gotBody, &req); err != nil {
+		t.Fatalf("decode branch request: %v\nbody: %s", err, gotBody)
+	}
+	var sawParentContext bool
+	for _, m := range req.Messages {
+		if m.Role == "system" && strings.Contains(m.Content, "root question") && strings.Contains(m.Content, "root reply") {
+			sawParentContext = true
+		}
+	}
+	if !sawParentContext {
+		t.Fatalf("expected the new branch's first request to inherit the parent's context, got messages: %+v", req.Messages)
+	}
+
+	db, err := sql.Open("sqlite", dialogstore.DefaultPath)
+	if err != nil {
+		t.Fatalf("open dialog db: %v", err)
+	}
+	defer db.Close()
+
+	var parentRows int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM dialog WHERE dialog_id = 'root' OR content = 'root question'`).Scan(&parentRows); err != nil {
+		t.Fatalf("count parent rows: %v", err)
+	}
+
+	rows, err := db.Query(`SELECT dialog_id, parent_id, content FROM dialog WHERE content = 'branch question'`)
+	if err != nil {
+		t.Fatalf("query branch rows: %v", err)
+	}
+	defer rows.Close()
+	var branchDialogID string
+	found := false
+	for rows.Next() {
+		var dialogID string
+		var parentID sql.NullString
+		var content string
+		if err := rows.Scan(&dialogID, &parentID, &content); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		branchDialogID = dialogID
+		if !parentID.Valid {
+			t.Fatalf("branch row parent_id is NULL, want it set to the parent dialog's id")
+		}
+		found = true
+	}
+	if !found {
+		t.Fatal("expected a row for the branch's own turn")
+	}
+	if branchDialogID == "" {
+		t.Fatal("expected the branch to have been written under its own new dialog_id")
+	}
+
+	var parentTurnCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM dialog WHERE dialog_id != ? AND content IN ('root question', 'root reply')`, branchDialogID).Scan(&parentTurnCount); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if parentTurnCount != 2 {
+		t.Fatalf("parent dialog's own rows = %d, want 2 (untouched by the fork)", parentTurnCount)
+	}
+}
+
+func TestRun_BranchingContinueKeepsSameDialog(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	responses := []string{
+		`{"choices":[{"message":{"role":"assistant","content":"reply-1"}}]}`,
+		`{"choices":[{"message":{"role":"assistant","content":"reply-2"}}]}`,
+	}
+	i := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(responses[i]))
+		i++
+	}))
+	defer server.Close()
+	cfg := &config.Config{MoonshotAPIKey: "secret", MoonshotBaseURL: server.URL, ContextStrategy: "Branching"}
+
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	defer pr.Close()
+	go func() {
+		defer pw.Close()
+		pw.Write([]byte("\n")) // Step D: default ("/new") — no branch step for a brand-new dialog
+		pw.Write([]byte("\n")) // Step A: default
+		pw.Write([]byte("question-1\n"))
+		pw.Write([]byte("exit\n"))
+	}()
+	var out bytes.Buffer
+	if err := Run(context.Background(), cfg, pr, &out, Options{}); err != nil {
+		t.Fatalf("first Run returned error: %v", err)
+	}
+
+	pr2, pw2, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	defer pr2.Close()
+	go func() {
+		defer pw2.Close()
+		pw2.Write([]byte("2\n")) // Step D: pick the dialog just created
+		pw2.Write([]byte("2\n")) // Branch step: "/continue" (option 2)
+		pw2.Write([]byte("\n"))  // Step A: default
+		pw2.Write([]byte("question-2\n"))
+	}()
+	var out2 bytes.Buffer
+	if err := Run(context.Background(), cfg, pr2, &out2, Options{}); err != nil {
+		t.Fatalf("second Run returned error: %v", err)
+	}
+
+	db, err := sql.Open("sqlite", dialogstore.DefaultPath)
+	if err != nil {
+		t.Fatalf("open dialog db: %v", err)
+	}
+	defer db.Close()
+
+	var dialogIDCount int
+	if err := db.QueryRow(`SELECT COUNT(DISTINCT dialog_id) FROM dialog`).Scan(&dialogIDCount); err != nil {
+		t.Fatalf("count distinct dialogs: %v", err)
+	}
+	if dialogIDCount != 1 {
+		t.Fatalf("distinct dialog_id count = %d, want 1 (\"/continue\" must not fork)", dialogIDCount)
+	}
+}
+
 func TestRun_ResumingExistingDialogSeedsContextAndPrintsHistory(t *testing.T) {
 	t.Chdir(t.TempDir()) // shared aiac9.db across both Run calls below
 

@@ -40,6 +40,7 @@ func Open(path string) (*Store, error) {
 CREATE TABLE IF NOT EXISTS dialog (
 	id                INTEGER PRIMARY KEY AUTOINCREMENT,
 	dialog_id         TEXT NOT NULL,
+	parent_id         TEXT,
 	role              TEXT NOT NULL,
 	content           TEXT NOT NULL,
 	model             TEXT,
@@ -72,6 +73,7 @@ CREATE TABLE IF NOT EXISTS facts (
 		`ALTER TABLE dialog ADD COLUMN prompt_tokens INTEGER`,
 		`ALTER TABLE dialog ADD COLUMN completion_tokens INTEGER`,
 		`ALTER TABLE dialog ADD COLUMN model TEXT`,
+		`ALTER TABLE dialog ADD COLUMN parent_id TEXT`,
 	} {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			db.Close()
@@ -88,17 +90,25 @@ CREATE TABLE IF NOT EXISTS facts (
 // model is the model this turn was sent to — CLAUDE.md's "Работа с
 // историей диалогов" reuses "последней использованной модели" of a
 // dialog when summarizing it, so every row records which model its turn
-// used. promptTokens/completionTokens are nil unless known — CLAUDE.md:
-// "prompt_tokens" в строчку с запросом и "completion_tokens" в строчку с
-// ответом", so callers pass promptTokens for a turn's request-side
-// messages (system/user) and completionTokens for its assistant reply,
-// leaving the other nil.
-func (s *Store) AppendMessage(dialogID, role, content, model string, promptTokens, completionTokens *int) error {
+// used. parentID is CLAUDE.md's Context Strategy "Branching": non-empty
+// only for a dialog forked off another one ("в значение поля parent_id
+// пишется id того диалога чьей веткой является создаваемый диалог"), and
+// then the same on every row of the branch, mirroring how model is
+// stamped on every row. promptTokens/completionTokens are nil unless known
+// — CLAUDE.md: "prompt_tokens" в строчку с запросом и "completion_tokens"
+// в строчку с ответом", so callers pass promptTokens for a turn's
+// request-side messages (system/user) and completionTokens for its
+// assistant reply, leaving the other nil.
+func (s *Store) AppendMessage(dialogID, role, content, model, parentID string, promptTokens, completionTokens *int) error {
+	var parent any
+	if parentID != "" {
+		parent = parentID
+	}
 	_, err := s.db.Exec(
-		`INSERT INTO dialog (dialog_id, role, content, model, prompt_tokens, completion_tokens, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO dialog (dialog_id, parent_id, role, content, model, prompt_tokens, completion_tokens, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		// Stored as text (not a driver-specific time.Time encoding) so it
 		// round-trips predictably regardless of SQL driver quirks.
-		dialogID, role, content, model, promptTokens, completionTokens, time.Now().Format(time.RFC3339Nano),
+		dialogID, parent, role, content, model, promptTokens, completionTokens, time.Now().Format(time.RFC3339Nano),
 	)
 	if err != nil {
 		return fmt.Errorf("insert dialog message: %w", err)
@@ -246,11 +256,28 @@ type DialogSummary struct {
 // ListDialogs returns a summary of every dialog with at least one message,
 // most recently active first.
 func (s *Store) ListDialogs() ([]DialogSummary, error) {
-	rows, err := s.db.Query(`
+	return s.summarizeDialogs(`
 		SELECT dialog_id, MAX(created_at) AS last_at
 		FROM dialog
 		GROUP BY dialog_id
 		ORDER BY last_at DESC`)
+}
+
+// Branches returns a summary of every dialog forked off parentID (its
+// parent_id — CLAUDE.md's Context Strategy "Branching"), most recently
+// active first — "если у диалога есть ветки, их необходимо давать выбирать
+// из консоли".
+func (s *Store) Branches(parentID string) ([]DialogSummary, error) {
+	return s.summarizeDialogs(`
+		SELECT dialog_id, MAX(created_at) AS last_at
+		FROM dialog
+		WHERE parent_id = ?
+		GROUP BY dialog_id
+		ORDER BY last_at DESC`, parentID)
+}
+
+func (s *Store) summarizeDialogs(query string, args ...any) ([]DialogSummary, error) {
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list dialogs: %w", err)
 	}

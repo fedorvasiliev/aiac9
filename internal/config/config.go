@@ -60,7 +60,7 @@ type Config struct {
 	// the plain HistoryMsgCount/HistorySummarization behavior above —
 	// CLAUDE.md's "### Context Strategy". Empty means that plain
 	// behavior; see the ContextStrategy* constants for the recognized
-	// values ("Sliding_Window", "STICKY_FACTS"), matched
+	// values ("Sliding_Window", "STICKY_FACTS", "Branching"), matched
 	// case-insensitively.
 	ContextStrategy string
 }
@@ -70,6 +70,7 @@ type Config struct {
 const (
 	ContextStrategySlidingWindow = "SLIDING_WINDOW"
 	ContextStrategyStickyFacts   = "STICKY_FACTS"
+	ContextStrategyBranching     = "BRANCHING"
 )
 
 // Load reads configuration from ./aiac9.config (if present) and
