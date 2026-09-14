@@ -117,7 +117,7 @@ func isNewDialogCommand(extra string) bool {
 // (CLAUDE.md's "## Диалоги" and "Шаг D"). It sends exactly one
 // dialogResult to resultCh before returning.
 func runDialog(ctx context.Context, cfg *config.Config, store *dialogstore.Store, masker *secretmask.Masker, stdin *os.File, reader *bufio.Reader, stdout io.Writer, opts Options, resultCh chan<- dialogResult) {
-	dialogID, dialogContext, ok := selectDialog(store, stdin, reader, stdout)
+	dialogID, dialogContext, dialogPromptTotal, dialogCompletionTotal, ok := selectDialog(store, stdin, reader, stdout)
 	if !ok {
 		resultCh <- dialogResult{}
 		return
@@ -216,8 +216,13 @@ func runDialog(ctx context.Context, cfg *config.Config, store *dialogstore.Store
 
 		fmt.Fprintln(stdout)
 		fmt.Fprintln(stdout, colorize(stdout, ansiGreen, masker.Mask(content)))
+
+		dialogPromptTotal += ex.PromptTokens
+		dialogCompletionTotal += ex.CompletionTokens
 		fmt.Fprintln(stdout)
-		fmt.Fprintf(stdout, "total_tokens: %d, время выполнения: %.2fs\n", ex.TotalTokens, ex.Duration.Seconds())
+		fmt.Fprintf(stdout, "prompt_tokens: %d, completion_tokens: %d\n", ex.PromptTokens, ex.CompletionTokens)
+		fmt.Fprintf(stdout, "dialog prompt_tokens: %d, dialog completion_tokens: %d\n", dialogPromptTotal, dialogCompletionTotal)
+		fmt.Fprintf(stdout, "время выполнения: %.2fs\n", ex.Duration.Seconds())
 
 		if logPath != "" {
 			if err := exchangelog.Finish(logPath, ex.StatusCode, ex.ResponseBody, ex.Duration, masker); err != nil {
@@ -228,14 +233,17 @@ func runDialog(ctx context.Context, cfg *config.Config, store *dialogstore.Store
 		}
 
 		// This turn's messages plus the reply enrich the dialog's context
-		// for its next turn, and are persisted per CLAUDE.md.
+		// for its next turn, and are persisted per CLAUDE.md — prompt_tokens
+		// on the request-side rows, completion_tokens on the reply's row.
 		if store != nil {
+			promptTokens := ex.PromptTokens
 			for _, m := range turnMessages {
-				if err := store.AppendMessage(dialogID, m.Role, m.Content); err != nil {
+				if err := store.AppendMessage(dialogID, m.Role, m.Content, &promptTokens, nil); err != nil {
 					fmt.Fprintln(stdout, "не удалось сохранить сообщение диалога:", err)
 				}
 			}
-			if err := store.AppendMessage(dialogID, "assistant", content); err != nil {
+			completionTokens := ex.CompletionTokens
+			if err := store.AppendMessage(dialogID, "assistant", content, nil, &completionTokens); err != nil {
 				fmt.Fprintln(stdout, "не удалось сохранить сообщение диалога:", err)
 			}
 		}
@@ -249,9 +257,11 @@ func runDialog(ctx context.Context, cfg *config.Config, store *dialogstore.Store
 // selectDialog runs Step D: pick "/new" to start a fresh dialog, or an
 // existing one to resume it. Resuming prints its last two Q&A pairs (per
 // CLAUDE.md) and returns its full history folded into one system-prompt
-// context string (see appendDialogContext). ok is false when the operator
-// exited (Ctrl+D, "exit"/"quit", or "q").
-func selectDialog(store *dialogstore.Store, stdin *os.File, reader *bufio.Reader, stdout io.Writer) (dialogID, dialogContext string, ok bool) {
+// context string (see appendDialogContext), plus that history's summed
+// prompt_tokens/completion_tokens to seed the running "dialog
+// prompt_tokens"/"dialog completion_tokens" totals. ok is false when the
+// operator exited (Ctrl+D, "exit"/"quit", or "q").
+func selectDialog(store *dialogstore.Store, stdin *os.File, reader *bufio.Reader, stdout io.Writer) (dialogID, dialogContext string, promptTotal, completionTotal int, ok bool) {
 	var summaries []dialogstore.DialogSummary
 	if store != nil {
 		var err error
@@ -271,10 +281,10 @@ func selectDialog(store *dialogstore.Store, stdin *os.File, reader *bufio.Reader
 
 	choice, selected := selectStep(stdin, reader, stdout, "Dialog", options, 0)
 	if !selected {
-		return "", "", false
+		return "", "", 0, 0, false
 	}
 	if choice == newDialogOption {
-		return newDialogID(), "", true
+		return newDialogID(), "", 0, 0, true
 	}
 
 	id := labelToID[choice]
@@ -291,8 +301,14 @@ func selectDialog(store *dialogstore.Store, stdin *os.File, reader *bufio.Reader
 
 	for _, m := range history {
 		appendDialogContext(&dialogContext, m.Role, m.Content)
+		if m.PromptTokens != nil {
+			promptTotal += *m.PromptTokens
+		}
+		if m.CompletionTokens != nil {
+			completionTotal += *m.CompletionTokens
+		}
 	}
-	return id, dialogContext, true
+	return id, dialogContext, promptTotal, completionTotal, true
 }
 
 // appendDialogContext folds one more message into *ctx, in the same

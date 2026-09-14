@@ -1,6 +1,7 @@
 package dialogstore
 
 import (
+	"database/sql"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -26,6 +27,47 @@ func TestOpen_CreatesSchemaAndIsIdempotent(t *testing.T) {
 	defer s2.Close()
 }
 
+func TestOpen_UpgradesPreExistingDatabaseMissingTokenColumns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+
+	// Simulate a database created by a version of this package before the
+	// prompt_tokens/completion_tokens columns existed.
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE dialog (
+		id         INTEGER PRIMARY KEY AUTOINCREMENT,
+		dialog_id  TEXT NOT NULL,
+		role       TEXT NOT NULL,
+		content    TEXT NOT NULL,
+		created_at DATETIME NOT NULL
+	)`); err != nil {
+		t.Fatalf("create legacy schema: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open on a legacy database: %v", err)
+	}
+	defer s.Close()
+
+	promptTokens := 3
+	if err := s.AppendMessage("dlg-1", "user", "hello", &promptTokens, nil); err != nil {
+		t.Fatalf("AppendMessage after upgrade: %v", err)
+	}
+	got, err := s.History("dlg-1")
+	if err != nil {
+		t.Fatalf("History after upgrade: %v", err)
+	}
+	if len(got) != 1 || got[0].PromptTokens == nil || *got[0].PromptTokens != 3 {
+		t.Fatalf("History after upgrade = %+v, want one row with PromptTokens=3", got)
+	}
+}
+
 func TestAppendMessage_StoresRowsUnderDialogID(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "test.db")
 	s, err := Open(path)
@@ -34,13 +76,13 @@ func TestAppendMessage_StoresRowsUnderDialogID(t *testing.T) {
 	}
 	defer s.Close()
 
-	if err := s.AppendMessage("dlg-1", "user", "hello"); err != nil {
+	if err := s.AppendMessage("dlg-1", "user", "hello", nil, nil); err != nil {
 		t.Fatalf("AppendMessage: %v", err)
 	}
-	if err := s.AppendMessage("dlg-1", "assistant", "hi there"); err != nil {
+	if err := s.AppendMessage("dlg-1", "assistant", "hi there", nil, nil); err != nil {
 		t.Fatalf("AppendMessage: %v", err)
 	}
-	if err := s.AppendMessage("dlg-2", "user", "unrelated dialog"); err != nil {
+	if err := s.AppendMessage("dlg-2", "user", "unrelated dialog", nil, nil); err != nil {
 		t.Fatalf("AppendMessage: %v", err)
 	}
 
@@ -81,9 +123,9 @@ func TestHistory_ReturnsOrderedMessagesForOneDialog(t *testing.T) {
 	}
 	defer s.Close()
 
-	s.AppendMessage("dlg-1", "user", "hello")
-	s.AppendMessage("dlg-1", "assistant", "hi there")
-	s.AppendMessage("dlg-2", "user", "unrelated")
+	s.AppendMessage("dlg-1", "user", "hello", nil, nil)
+	s.AppendMessage("dlg-1", "assistant", "hi there", nil, nil)
+	s.AppendMessage("dlg-2", "user", "unrelated", nil, nil)
 
 	got, err := s.History("dlg-1")
 	if err != nil {
@@ -92,6 +134,46 @@ func TestHistory_ReturnsOrderedMessagesForOneDialog(t *testing.T) {
 	want := []Message{{Role: "user", Content: "hello"}, {Role: "assistant", Content: "hi there"}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("History(dlg-1) = %+v, want %+v", got, want)
+	}
+}
+
+func TestAppendMessage_PersistsPromptAndCompletionTokens(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	promptTokens := 5
+	completionTokens := 7
+	// CLAUDE.md: prompt_tokens on the request row, completion_tokens on
+	// the response row — the other left nil on each.
+	if err := s.AppendMessage("dlg-1", "user", "hello", &promptTokens, nil); err != nil {
+		t.Fatalf("AppendMessage: %v", err)
+	}
+	if err := s.AppendMessage("dlg-1", "assistant", "hi there", nil, &completionTokens); err != nil {
+		t.Fatalf("AppendMessage: %v", err)
+	}
+
+	got, err := s.History("dlg-1")
+	if err != nil {
+		t.Fatalf("History: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("History(dlg-1) = %+v, want 2 rows", got)
+	}
+	if got[0].PromptTokens == nil || *got[0].PromptTokens != 5 {
+		t.Fatalf("row 0 PromptTokens = %v, want 5", got[0].PromptTokens)
+	}
+	if got[0].CompletionTokens != nil {
+		t.Fatalf("row 0 CompletionTokens = %v, want nil", *got[0].CompletionTokens)
+	}
+	if got[1].CompletionTokens == nil || *got[1].CompletionTokens != 7 {
+		t.Fatalf("row 1 CompletionTokens = %v, want 7", got[1].CompletionTokens)
+	}
+	if got[1].PromptTokens != nil {
+		t.Fatalf("row 1 PromptTokens = %v, want nil", *got[1].PromptTokens)
 	}
 }
 
@@ -120,11 +202,11 @@ func TestListDialogs_OrdersByMostRecentAndIncludesExcerpt(t *testing.T) {
 	}
 	defer s.Close()
 
-	s.AppendMessage("dlg-old", "user", "old question")
-	s.AppendMessage("dlg-old", "assistant", "old answer")
+	s.AppendMessage("dlg-old", "user", "old question", nil, nil)
+	s.AppendMessage("dlg-old", "assistant", "old answer", nil, nil)
 	time.Sleep(10 * time.Millisecond) // ensure a distinct created_at ordering
-	s.AppendMessage("dlg-new", "user", "new question")
-	s.AppendMessage("dlg-new", "assistant", "new answer")
+	s.AppendMessage("dlg-new", "user", "new question", nil, nil)
+	s.AppendMessage("dlg-new", "assistant", "new answer", nil, nil)
 
 	got, err := s.ListDialogs()
 	if err != nil {
@@ -178,7 +260,7 @@ func TestClose_ClosesUnderlyingDB(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if err := s.AppendMessage("dlg-1", "user", "hello"); err == nil {
+	if err := s.AppendMessage("dlg-1", "user", "hello", nil, nil); err == nil {
 		t.Fatal("expected AppendMessage to fail on a closed store")
 	}
 }

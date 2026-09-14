@@ -82,7 +82,9 @@ type response struct {
 		Message Message `json:"message"`
 	} `json:"choices"`
 	Usage *struct {
-		TotalTokens int `json:"total_tokens"`
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+		TotalTokens      int `json:"total_tokens"`
 	} `json:"usage"`
 	Error *struct {
 		Message string `json:"message"`
@@ -105,9 +107,12 @@ type Exchange struct {
 	// logged.
 	Duration time.Duration
 
-	// TotalTokens is the response's usage.total_tokens, if present —
-	// CLAUDE.md requires it printed alongside the reply.
-	TotalTokens int
+	// PromptTokens, CompletionTokens and TotalTokens mirror the response's
+	// usage object, if present — CLAUDE.md requires the first two printed
+	// alongside the reply (and summed per-dialog).
+	PromptTokens     int
+	CompletionTokens int
+	TotalTokens      int
 }
 
 // Complete sends messages to model and returns the assistant's reply text
@@ -170,6 +175,8 @@ func (c *Client) Complete(ctx context.Context, model string, messages []Message,
 		return "", ex, fmt.Errorf("decode response: %w", err)
 	}
 	if resp.Usage != nil {
+		ex.PromptTokens = resp.Usage.PromptTokens
+		ex.CompletionTokens = resp.Usage.CompletionTokens
 		ex.TotalTokens = resp.Usage.TotalTokens
 	}
 	if resp.Error != nil {

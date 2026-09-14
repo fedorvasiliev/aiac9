@@ -38,15 +38,31 @@ func Open(path string) (*Store, error) {
 
 	const schema = `
 CREATE TABLE IF NOT EXISTS dialog (
-	id         INTEGER PRIMARY KEY AUTOINCREMENT,
-	dialog_id  TEXT NOT NULL,
-	role       TEXT NOT NULL,
-	content    TEXT NOT NULL,
-	created_at DATETIME NOT NULL
+	id                INTEGER PRIMARY KEY AUTOINCREMENT,
+	dialog_id         TEXT NOT NULL,
+	role              TEXT NOT NULL,
+	content           TEXT NOT NULL,
+	prompt_tokens     INTEGER,
+	completion_tokens INTEGER,
+	created_at        DATETIME NOT NULL
 );`
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("create dialog table: %w", err)
+	}
+
+	// Best-effort upgrade for a database file created before these columns
+	// existed: SQLite has no "ADD COLUMN IF NOT EXISTS", so a "duplicate
+	// column" failure (the common case: the table was already current) is
+	// expected and ignored.
+	for _, stmt := range []string{
+		`ALTER TABLE dialog ADD COLUMN prompt_tokens INTEGER`,
+		`ALTER TABLE dialog ADD COLUMN completion_tokens INTEGER`,
+	} {
+		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			db.Close()
+			return nil, fmt.Errorf("upgrade dialog table: %w", err)
+		}
 	}
 
 	return &Store{db: db}, nil
@@ -55,12 +71,16 @@ CREATE TABLE IF NOT EXISTS dialog (
 // AppendMessage records one dialog message: dialogID groups every message
 // of the same conversation together, role/content mirror the LLM chat
 // message they came from ("system"/"user"/"assistant" and message.content).
-func (s *Store) AppendMessage(dialogID, role, content string) error {
+// promptTokens/completionTokens are nil unless known — CLAUDE.md: "prompt_tokens"
+// в строчку с запросом и "completion_tokens" в строчку с ответом", so
+// callers pass promptTokens for a turn's request-side messages (system/user)
+// and completionTokens for its assistant reply, leaving the other nil.
+func (s *Store) AppendMessage(dialogID, role, content string, promptTokens, completionTokens *int) error {
 	_, err := s.db.Exec(
-		`INSERT INTO dialog (dialog_id, role, content, created_at) VALUES (?, ?, ?, ?)`,
+		`INSERT INTO dialog (dialog_id, role, content, prompt_tokens, completion_tokens, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
 		// Stored as text (not a driver-specific time.Time encoding) so it
 		// round-trips predictably regardless of SQL driver quirks.
-		dialogID, role, content, time.Now().Format(time.RFC3339Nano),
+		dialogID, role, content, promptTokens, completionTokens, time.Now().Format(time.RFC3339Nano),
 	)
 	if err != nil {
 		return fmt.Errorf("insert dialog message: %w", err)
@@ -70,13 +90,17 @@ func (s *Store) AppendMessage(dialogID, role, content string) error {
 
 // Message is one persisted dialog message, as returned by History.
 type Message struct {
-	Role    string
-	Content string
+	Role             string
+	Content          string
+	PromptTokens     *int // nil unless this row recorded a request's prompt_tokens
+	CompletionTokens *int // nil unless this row recorded a response's completion_tokens
 }
 
 // History returns every message of dialogID, oldest first.
 func (s *Store) History(dialogID string) ([]Message, error) {
-	rows, err := s.db.Query(`SELECT role, content FROM dialog WHERE dialog_id = ? ORDER BY id`, dialogID)
+	rows, err := s.db.Query(
+		`SELECT role, content, prompt_tokens, completion_tokens FROM dialog WHERE dialog_id = ? ORDER BY id`, dialogID,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("query dialog history: %w", err)
 	}
@@ -85,8 +109,17 @@ func (s *Store) History(dialogID string) ([]Message, error) {
 	var history []Message
 	for rows.Next() {
 		var m Message
-		if err := rows.Scan(&m.Role, &m.Content); err != nil {
+		var promptTokens, completionTokens sql.NullInt64
+		if err := rows.Scan(&m.Role, &m.Content, &promptTokens, &completionTokens); err != nil {
 			return nil, fmt.Errorf("scan dialog message: %w", err)
+		}
+		if promptTokens.Valid {
+			v := int(promptTokens.Int64)
+			m.PromptTokens = &v
+		}
+		if completionTokens.Valid {
+			v := int(completionTokens.Int64)
+			m.CompletionTokens = &v
 		}
 		history = append(history, m)
 	}

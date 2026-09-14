@@ -111,12 +111,18 @@ func TestRun_NoPromptUsesDefaultModel(t *testing.T) {
 	}
 }
 
-func TestRun_PrintsTotalTokensAndDuration(t *testing.T) {
+func TestRun_PrintsPerRequestAndDialogTokenCountsAndDuration(t *testing.T) {
 	t.Chdir(t.TempDir()) // isolate the dialog SQLite file this run opens
 
+	responses := []string{
+		`{"choices":[{"message":{"role":"assistant","content":"hi"}}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`,
+		`{"choices":[{"message":{"role":"assistant","content":"hi again"}}],"usage":{"prompt_tokens":20,"completion_tokens":8,"total_tokens":28}}`,
+	}
+	i := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"hi"}}],"usage":{"total_tokens":42}}`))
+		_, _ = w.Write([]byte(responses[i]))
+		i++
 	}))
 	defer server.Close()
 
@@ -128,7 +134,11 @@ func TestRun_PrintsTotalTokensAndDuration(t *testing.T) {
 
 	go func() {
 		defer pw.Close()
-		pw.Write([]byte("\n\nhello\n")) // Step D default, Step A default, Step T
+		pw.Write([]byte("\n"))          // Step D default
+		pw.Write([]byte("\n"))          // Step A default, turn 1
+		pw.Write([]byte("hello\n"))     // Step T, turn 1
+		pw.Write([]byte("\n"))          // Step A default, turn 2
+		pw.Write([]byte("hello two\n")) // Step T, turn 2
 	}()
 
 	cfg := &config.Config{MoonshotAPIKey: "secret", MoonshotBaseURL: server.URL}
@@ -138,16 +148,25 @@ func TestRun_PrintsTotalTokensAndDuration(t *testing.T) {
 	}
 
 	got := out.String()
-	if !strings.Contains(got, "total_tokens: 42") {
-		t.Fatalf("expected total_tokens to be printed, got:\n%s", got)
+	if !strings.Contains(got, "prompt_tokens: 10, completion_tokens: 5") {
+		t.Fatalf("expected turn 1's own prompt_tokens/completion_tokens to be printed, got:\n%s", got)
+	}
+	if !strings.Contains(got, "dialog prompt_tokens: 10, dialog completion_tokens: 5") {
+		t.Fatalf("expected turn 1's dialog-cumulative totals to equal its own counts, got:\n%s", got)
+	}
+	if !strings.Contains(got, "prompt_tokens: 20, completion_tokens: 8") {
+		t.Fatalf("expected turn 2's own prompt_tokens/completion_tokens to be printed, got:\n%s", got)
+	}
+	if !strings.Contains(got, "dialog prompt_tokens: 30, dialog completion_tokens: 13") {
+		t.Fatalf("expected turn 2's dialog-cumulative totals to add turn 1's, got:\n%s", got)
 	}
 	// "с точностью до сотых долей секунды" — hundredths of a second, i.e.
 	// exactly two decimal places, e.g. "0.00s".
 	if !regexp.MustCompile(`время выполнения: \d+\.\d\ds`).MatchString(got) {
 		t.Fatalf("expected the request duration printed to hundredths of a second, got:\n%s", got)
 	}
-	if !strings.Contains(got, "hi\n\ntotal_tokens:") {
-		t.Fatalf("expected a blank line before total_tokens/duration, got:\n%s", got)
+	if !strings.Contains(got, "hi\n\nprompt_tokens:") {
+		t.Fatalf("expected a blank line before prompt_tokens/dialog totals, got:\n%s", got)
 	}
 }
 
@@ -324,7 +343,7 @@ func TestRun_ResumingExistingDialogSeedsContextAndPrintsHistory(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"reply-1"}}]}`))
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"reply-1"}}],"usage":{"prompt_tokens":10,"completion_tokens":4}}`))
 	}))
 	defer server.Close()
 	cfg := &config.Config{MoonshotAPIKey: "secret", MoonshotBaseURL: server.URL}
@@ -355,7 +374,7 @@ func TestRun_ResumingExistingDialogSeedsContextAndPrintsHistory(t *testing.T) {
 	server2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotBody, _ = io.ReadAll(r.Body)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"reply-2"}}]}`))
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"reply-2"}}],"usage":{"prompt_tokens":6,"completion_tokens":3}}`))
 	}))
 	defer server2.Close()
 	cfg2 := &config.Config{MoonshotAPIKey: "secret", MoonshotBaseURL: server2.URL}
@@ -402,6 +421,13 @@ func TestRun_ResumingExistingDialogSeedsContextAndPrintsHistory(t *testing.T) {
 	}
 	if req.Messages[1].Content != "question-2" {
 		t.Fatalf("messages[1] = %+v, want the new turn's own question", req.Messages[1])
+	}
+
+	// The dialog-cumulative totals must be seeded from the resumed
+	// dialog's persisted history (10/4 from turn 1) before adding this
+	// turn's own counts (6/3) — not start back at 0.
+	if !strings.Contains(got, "dialog prompt_tokens: 16, dialog completion_tokens: 7") {
+		t.Fatalf("expected dialog token totals seeded from the resumed history, got:\n%s", got)
 	}
 }
 

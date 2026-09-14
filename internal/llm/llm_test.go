@@ -147,6 +147,12 @@ func TestComplete_RecordsUsageAndDuration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Complete returned error: %v", err)
 	}
+	if ex.PromptTokens != 5 {
+		t.Fatalf("PromptTokens = %d, want 5", ex.PromptTokens)
+	}
+	if ex.CompletionTokens != 7 {
+		t.Fatalf("CompletionTokens = %d, want 7", ex.CompletionTokens)
+	}
 	if ex.TotalTokens != 12 {
 		t.Fatalf("TotalTokens = %d, want 12", ex.TotalTokens)
 	}
@@ -168,8 +174,8 @@ func TestComplete_MissingUsageLeavesTotalTokensZero(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Complete returned error: %v", err)
 	}
-	if ex.TotalTokens != 0 {
-		t.Fatalf("TotalTokens = %d, want 0 when usage is absent", ex.TotalTokens)
+	if ex.PromptTokens != 0 || ex.CompletionTokens != 0 || ex.TotalTokens != 0 {
+		t.Fatalf("PromptTokens/CompletionTokens/TotalTokens = %d/%d/%d, want all 0 when usage is absent", ex.PromptTokens, ex.CompletionTokens, ex.TotalTokens)
 	}
 }
 
