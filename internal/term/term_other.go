@@ -2,7 +2,10 @@
 
 package term
 
-import "errors"
+import (
+	"errors"
+	"time"
+)
 
 // State is unused on platforms without raw-mode support.
 type State struct{}
@@ -19,3 +22,9 @@ func MakeRaw(fd uintptr) (*State, error) {
 
 // Restore is a no-op counterpart to MakeRaw on this platform.
 func Restore(fd uintptr, state *State) error { return nil }
+
+// WaitReadable is not implemented for this platform; IsTerminal already
+// reports false here, so callers never reach it.
+func WaitReadable(fd uintptr, timeout time.Duration) (bool, error) {
+	return false, errors.New("polling stdin is not supported on this platform")
+}

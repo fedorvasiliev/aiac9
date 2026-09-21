@@ -4,6 +4,7 @@ package term
 
 import (
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -52,4 +53,30 @@ func ioctl(fd uintptr, req uintptr, arg unsafe.Pointer) error {
 		return errno
 	}
 	return nil
+}
+
+// WaitReadable blocks until fd has data available to read or timeout
+// elapses, reporting which, without consuming any bytes itself. TTYs on
+// this platform reject *os.File.SetReadDeadline ("file type does not
+// support deadline"), so a read against them cannot be given a deadline
+// directly; select(2) on the raw fd is the way to poll one with a timeout
+// instead, letting a caller (runWithConsole) alternate between animating a
+// spinner and checking whether a background request has finished, without
+// ever leaving a blocking Read in flight when it stops polling.
+func WaitReadable(fd uintptr, timeout time.Duration) (bool, error) {
+	var set syscall.FdSet
+	fdSet(&set, fd)
+	tv := syscall.NsecToTimeval(timeout.Nanoseconds())
+	if err := syscall.Select(int(fd)+1, &set, nil, nil, &tv); err != nil {
+		return false, err
+	}
+	return fdIsSet(&set, fd), nil
+}
+
+func fdSet(set *syscall.FdSet, fd uintptr) {
+	set.Bits[fd/32] |= 1 << (fd % 32)
+}
+
+func fdIsSet(set *syscall.FdSet, fd uintptr) bool {
+	return set.Bits[fd/32]&(1<<(fd%32)) != 0
 }

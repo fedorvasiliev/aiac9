@@ -174,6 +174,9 @@ func runDialog(ctx context.Context, cfg *config.Config, store *dialogstore.Store
 			resultCh <- dialogResult{restart: true}
 			return
 		}
+		if consoleCommand(store, stdout, masker, extra) {
+			continue
+		}
 
 		turnMessages, model, llmOpts := assembleRequest(tmpl, defaultModel, extra)
 		if len(turnMessages) == 0 {
@@ -230,7 +233,7 @@ func runDialog(ctx context.Context, cfg *config.Config, store *dialogstore.Store
 
 		var content string
 		var ex *llm.Exchange
-		runWithSpinner(stdout, func() {
+		runWithConsole(stdin, reader, stdout, store, masker, func() {
 			content, ex, err = client.Complete(ctx, model, fullMessages, llmOpts, onRequest)
 		})
 		if err != nil {
