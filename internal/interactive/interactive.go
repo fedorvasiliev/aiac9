@@ -323,10 +323,11 @@ func runTurn(ctx context.Context, cfg *config.Config, store *dialogstore.Store, 
 
 	// --- validation ---
 	var facts []dialogstore.Fact
-	paused = runPhase(ctx, stdin, reader, stdout, store, masker, phaseValidation, func(_ context.Context) {
+	paused = runPhase(ctx, stdin, reader, stdout, store, masker, phaseValidation, func(pctx context.Context) {
 		if stickyFacts {
 			content, facts = extractFacts(content)
 		}
+		validateInvariants(pctx, store, client, model, content, masker, stdout)
 	})
 	if paused {
 		saveTaskState(store, dialogID, phaseValidation, promptFile, extra, stdout)

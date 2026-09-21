@@ -11,16 +11,17 @@ import (
 
 // CLAUDE.md's "### Команды в консоле": "/profile - выводит текущий
 // активный профайл", "/pause - пауза в работе агента", "/resume -
-// возобновление работы агента с сохраненного шага". /pause and /resume
-// have control-flow effects (aborting/replaying a turn) beyond printing
-// something, so they're recognized separately — isPauseCommand/
-// isResumeCommand below, checked by phase.go's runPhase and by
-// runDialog's Step T handling — rather than through consoleCommand, which
-// only ever prints and returns.
+// возобновление работы агента с сохраненного шага", "/invariants -
+// выводит текущие инварианты". /pause and /resume have control-flow
+// effects (aborting/replaying a turn) beyond printing something, so
+// they're recognized separately — isPauseCommand/isResumeCommand below,
+// checked by phase.go's runPhase and by runDialog's Step T handling —
+// rather than through consoleCommand, which only ever prints and returns.
 const (
-	cmdProfile = "/profile"
-	cmdPause   = "/pause"
-	cmdResume  = "/resume"
+	cmdProfile    = "/profile"
+	cmdPause      = "/pause"
+	cmdResume     = "/resume"
+	cmdInvariants = "/invariants"
 )
 
 // isPauseCommand and isResumeCommand report whether s (case-insensitively,
@@ -37,6 +38,9 @@ func consoleCommand(store *dialogstore.Store, stdout io.Writer, masker *secretma
 	switch strings.ToLower(strings.TrimSpace(line)) {
 	case cmdProfile:
 		printActiveProfile(store, stdout, masker)
+		return true
+	case cmdInvariants:
+		printActiveInvariants(store, stdout, masker)
 		return true
 	default:
 		return false
@@ -62,4 +66,25 @@ func printActiveProfile(store *dialogstore.Store, stdout io.Writer, masker *secr
 	}
 	fmt.Fprintln(stdout, colorize(stdout, ansiYellow, "Профиль агента:"))
 	fmt.Fprintln(stdout, masker.Mask(profile))
+}
+
+// printActiveInvariants handles /invariants. saveAgentFields (agent.go) is
+// what populates the agent table's Invariants column, from a prompt
+// template's "Invariants" heading.
+func printActiveInvariants(store *dialogstore.Store, stdout io.Writer, masker *secretmask.Masker) {
+	if store == nil {
+		fmt.Fprintln(stdout, "инварианты агента недоступны: база диалогов не открыта")
+		return
+	}
+	_, invariants, err := store.Agent()
+	if err != nil {
+		fmt.Fprintln(stdout, "не удалось загрузить инварианты агента:", masker.Mask(err.Error()))
+		return
+	}
+	if invariants == "" {
+		fmt.Fprintln(stdout, "текущие инварианты не заданы")
+		return
+	}
+	fmt.Fprintln(stdout, colorize(stdout, ansiYellow, "Инварианты агента:"))
+	fmt.Fprintln(stdout, masker.Mask(invariants))
 }
