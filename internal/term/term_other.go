@@ -23,6 +23,12 @@ func MakeRaw(fd uintptr) (*State, error) {
 // Restore is a no-op counterpart to MakeRaw on this platform.
 func Restore(fd uintptr, state *State) error { return nil }
 
+// WaitAny is not implemented for this platform; IsTerminal already reports
+// false here, so callers never reach it.
+func WaitAny(fds []uintptr, timeout time.Duration) ([]bool, error) {
+	return nil, errors.New("polling stdin is not supported on this platform")
+}
+
 // WaitReadable is not implemented for this platform; IsTerminal already
 // reports false here, so callers never reach it.
 func WaitReadable(fd uintptr, timeout time.Duration) (bool, error) {

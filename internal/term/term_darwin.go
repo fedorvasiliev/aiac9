@@ -55,22 +55,42 @@ func ioctl(fd uintptr, req uintptr, arg unsafe.Pointer) error {
 	return nil
 }
 
-// WaitReadable blocks until fd has data available to read or timeout
-// elapses, reporting which, without consuming any bytes itself. TTYs on
-// this platform reject *os.File.SetReadDeadline ("file type does not
-// support deadline"), so a read against them cannot be given a deadline
-// directly; select(2) on the raw fd is the way to poll one with a timeout
-// instead, letting a caller (runWithConsole) alternate between animating a
-// spinner and checking whether a background request has finished, without
-// ever leaving a blocking Read in flight when it stops polling.
-func WaitReadable(fd uintptr, timeout time.Duration) (bool, error) {
+// WaitAny blocks until at least one of fds has data available to read, or
+// timeout elapses, reporting per-fd readiness without consuming any bytes
+// itself. TTYs on this platform reject *os.File.SetReadDeadline ("file
+// type does not support deadline"), so a read against them cannot be given
+// a deadline directly; select(2) on the raw fds is the way to poll them
+// with a timeout instead. runPhase watches stdin plus a private wake-up
+// pipe it closes when the phase's own work finishes, so it reacts to
+// either immediately — no periodic timer needed — while guaranteeing no
+// blocking Read is ever left in flight once it stops polling.
+func WaitAny(fds []uintptr, timeout time.Duration) ([]bool, error) {
 	var set syscall.FdSet
-	fdSet(&set, fd)
+	var maxFd uintptr
+	for _, fd := range fds {
+		fdSet(&set, fd)
+		if fd > maxFd {
+			maxFd = fd
+		}
+	}
 	tv := syscall.NsecToTimeval(timeout.Nanoseconds())
-	if err := syscall.Select(int(fd)+1, &set, nil, nil, &tv); err != nil {
+	if err := syscall.Select(int(maxFd)+1, &set, nil, nil, &tv); err != nil {
+		return nil, err
+	}
+	ready := make([]bool, len(fds))
+	for i, fd := range fds {
+		ready[i] = fdIsSet(&set, fd)
+	}
+	return ready, nil
+}
+
+// WaitReadable is WaitAny for a single fd.
+func WaitReadable(fd uintptr, timeout time.Duration) (bool, error) {
+	ready, err := WaitAny([]uintptr{fd}, timeout)
+	if err != nil {
 		return false, err
 	}
-	return fdIsSet(&set, fd), nil
+	return ready[0], nil
 }
 
 func fdSet(set *syscall.FdSet, fd uintptr) {

@@ -9,15 +9,30 @@ import (
 	"github.com/fedorvasiliev/aiac9/internal/secretmask"
 )
 
-// cmdProfile is CLAUDE.md's "### Команды в консоле": "/profile - выводит
-// текущий активный профайл".
-const cmdProfile = "/profile"
+// CLAUDE.md's "### Команды в консоле": "/profile - выводит текущий
+// активный профайл", "/pause - пауза в работе агента", "/resume -
+// возобновление работы агента с сохраненного шага". /pause and /resume
+// have control-flow effects (aborting/replaying a turn) beyond printing
+// something, so they're recognized separately — isPauseCommand/
+// isResumeCommand below, checked by phase.go's runPhase and by
+// runDialog's Step T handling — rather than through consoleCommand, which
+// only ever prints and returns.
+const (
+	cmdProfile = "/profile"
+	cmdPause   = "/pause"
+	cmdResume  = "/resume"
+)
 
-// consoleCommand recognizes and runs a console command typed as line
-// (case-insensitively, surrounding whitespace ignored), reporting whether
-// line was one — so a caller can decide what unrecognized input means in
-// its own context (Step T: send it as prompt text; the in-flight wait
-// window in runWithConsole: report it as not a command).
+// isPauseCommand and isResumeCommand report whether s (case-insensitively,
+// surrounding whitespace ignored) is that command.
+func isPauseCommand(s string) bool  { return strings.EqualFold(strings.TrimSpace(s), cmdPause) }
+func isResumeCommand(s string) bool { return strings.EqualFold(strings.TrimSpace(s), cmdResume) }
+
+// consoleCommand recognizes and runs a print-only console command typed as
+// line (case-insensitively, surrounding whitespace ignored), reporting
+// whether line was one — so a caller can decide what unrecognized input
+// means in its own context (Step T: send it as prompt text; a runPhase
+// wait window: report it as not a command).
 func consoleCommand(store *dialogstore.Store, stdout io.Writer, masker *secretmask.Masker, line string) bool {
 	switch strings.ToLower(strings.TrimSpace(line)) {
 	case cmdProfile:

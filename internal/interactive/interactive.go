@@ -13,6 +13,7 @@ package interactive
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -27,6 +28,10 @@ import (
 	"github.com/fedorvasiliev/aiac9/internal/promptfile"
 	"github.com/fedorvasiliev/aiac9/internal/secretmask"
 )
+
+// errNothingToSend is runTurn's planning-phase error when there is neither
+// a prompt template nor typed text to send.
+var errNothingToSend = errors.New("нечего отправлять: выберите промпт-шаблон или введите текст")
 
 // defaultModel is used when no prompt template is selected at Step A, or
 // the selected one doesn't specify a Model heading.
@@ -109,6 +114,15 @@ type dialogResult struct {
 	err     error
 }
 
+// turnOutcome is runTurn's result: how its state machine ended.
+type turnOutcome int
+
+const (
+	turnDone   turnOutcome = iota // ran to completion (successfully or with an already-reported error)
+	turnPaused                    // the operator typed "/pause"; state was saved for a later "/resume"
+	turnExit                      // the context was canceled mid-flight — the wizard should stop
+)
+
 func newDialogID() string {
 	return fmt.Sprintf("%d", time.Now().UnixNano())
 }
@@ -154,7 +168,9 @@ func runDialog(ctx context.Context, cfg *config.Config, store *dialogstore.Store
 		}
 
 		var tmpl *promptfile.Prompt
+		var promptFile string
 		if promptOption != userPromptOption {
+			promptFile = promptOption
 			tmpl, err = promptfile.Parse(filepath.Join(promptfile.Dir, promptOption))
 			if err != nil {
 				fmt.Fprintf(stdout, "не удалось разобрать %s: %v\n", promptOption, err)
@@ -174,34 +190,80 @@ func runDialog(ctx context.Context, cfg *config.Config, store *dialogstore.Store
 			resultCh <- dialogResult{restart: true}
 			return
 		}
-		if consoleCommand(store, stdout, masker, extra) {
+		if isPauseCommand(extra) {
+			fmt.Fprintln(stdout, "нет выполняющейся задачи — приостанавливать нечего")
+			continue
+		}
+		if isResumeCommand(extra) {
+			savedPhase, savedFile, savedExtra, has := loadTaskState(store, dialogID, stdout)
+			if !has {
+				fmt.Fprintln(stdout, "нет сохранённого состояния для возобновления")
+				continue
+			}
+			fmt.Fprintln(stdout, "возобновляю с этапа:", savedPhase)
+			tmpl, promptFile = nil, savedFile
+			if savedFile != "" {
+				tmpl, err = promptfile.Parse(filepath.Join(promptfile.Dir, savedFile))
+				if err != nil {
+					fmt.Fprintf(stdout, "не удалось разобрать %s: %v\n", savedFile, err)
+					continue
+				}
+				printPromptTable(stdout, tmpl)
+			}
+			extra = savedExtra
+		} else if consoleCommand(store, stdout, masker, extra) {
 			continue
 		}
 
-		turnMessages, model, llmOpts := assembleRequest(tmpl, defaultModel, extra)
+		switch runTurn(ctx, cfg, store, masker, stdin, reader, stdout, opts, dialogID, parentID, tmpl, promptFile, extra, &dialogContext, &dialogPromptTotal, &dialogCompletionTotal) {
+		case turnExit:
+			resultCh <- dialogResult{}
+			return
+		}
+	}
+}
+
+// runTurn drives one Step T submission through CLAUDE.md's "### State
+// Machine": planning → execution → validation → done, each phase printed
+// explicitly and pausable via "/pause" (see runPhase). Pausing at any
+// phase saves just enough to redo the turn later via "/resume" — the
+// selected prompt file and Step T's typed text (CLAUDE.md's "###
+// Команды в консоле") — since only the planning phase is idempotent;
+// execution's result is never persisted mid-flight, so resuming past
+// planning always re-sends the request rather than replaying a stored
+// reply.
+func runTurn(ctx context.Context, cfg *config.Config, store *dialogstore.Store, masker *secretmask.Masker, stdin *os.File, reader *bufio.Reader, stdout io.Writer, opts Options, dialogID, parentID string, tmpl *promptfile.Prompt, promptFile, extra string, dialogContext *string, dialogPromptTotal, dialogCompletionTotal *int) turnOutcome {
+	stickyFacts := strings.EqualFold(cfg.ContextStrategy, config.ContextStrategyStickyFacts)
+
+	// --- planning ---
+	var turnMessages []llm.Message
+	var model string
+	var llmOpts llm.Options
+	var client *llm.Client
+	var fullMessages []llm.Message
+	var planErr error
+
+	paused := runPhase(ctx, stdin, reader, stdout, store, masker, phasePlanning, func(_ context.Context) {
+		turnMessages, model, llmOpts = assembleRequest(tmpl, defaultModel, extra)
 		if len(turnMessages) == 0 {
-			fmt.Fprintln(stdout, "нечего отправлять: выберите промпт-шаблон или введите текст")
-			continue
+			planErr = errNothingToSend
+			return
 		}
-
-		client, err := resolveClient(model, cfg)
-		if err != nil {
-			fmt.Fprintln(stdout, masker.Mask(err.Error()))
-			continue
+		client, planErr = resolveClient(model, cfg)
+		if planErr != nil {
+			return
 		}
 		if opts.ResponseTimeout != nil {
 			client.HTTPClient.Timeout = *opts.ResponseTimeout
 		}
 
-		stickyFacts := strings.EqualFold(cfg.ContextStrategy, config.ContextStrategyStickyFacts)
-
 		// The dialog's history so far is folded into one system message
 		// (CLAUDE.md's Step D: "обогатить ей system prompt"), ahead of
 		// this turn's own messages. CONTEXT_STRATEGY=STICKY_FACTS adds a
 		// system message of previously extracted facts too, plus an
-		// instruction (after the turn's own messages) telling the model to
-		// extract new facts into a dedicated section of its reply.
-		fullMessages := make([]llm.Message, 0, len(turnMessages)+3)
+		// instruction (after the turn's own messages) telling the model
+		// to extract new facts into a dedicated section of its reply.
+		fullMessages = make([]llm.Message, 0, len(turnMessages)+3)
 		for _, ac := range agentContext(store, stdout) {
 			fullMessages = append(fullMessages, llm.Message{Role: "system", Content: ac})
 		}
@@ -210,18 +272,33 @@ func runDialog(ctx context.Context, cfg *config.Config, store *dialogstore.Store
 				fullMessages = append(fullMessages, llm.Message{Role: "system", Content: fc})
 			}
 		}
-		if dialogContext != "" {
-			fullMessages = append(fullMessages, llm.Message{Role: "system", Content: dialogContext})
+		if *dialogContext != "" {
+			fullMessages = append(fullMessages, llm.Message{Role: "system", Content: *dialogContext})
 		}
 		fullMessages = append(fullMessages, turnMessages...)
 		if stickyFacts {
 			fullMessages = append(fullMessages, llm.Message{Role: "system", Content: factsInstruction})
 		}
+	})
+	if paused {
+		saveTaskState(store, dialogID, phasePlanning, promptFile, extra, stdout)
+		return turnPaused
+	}
+	if planErr != nil {
+		fmt.Fprintln(stdout, masker.Mask(planErr.Error()))
+		return turnDone
+	}
 
-		// The request must be logged right before it is sent (CLAUDE.md),
-		// not only once the response comes back — so the log file is
-		// started from inside Complete, right before the HTTP call.
-		var logPath string
+	// --- execution ---
+	// The request must be logged right before it is sent (CLAUDE.md), not
+	// only once the response comes back — so the log file is started from
+	// inside Complete, right before the HTTP call.
+	var logPath string
+	var content string
+	var ex *llm.Exchange
+	var reqErr error
+
+	paused = runPhase(ctx, stdin, reader, stdout, store, masker, phaseExecution, func(pctx context.Context) {
 		onRequest := func(reqBody []byte) {
 			path, logErr := exchangelog.Start(exchangelog.Dir, model, reqBody, masker)
 			if logErr != nil {
@@ -230,37 +307,46 @@ func runDialog(ctx context.Context, cfg *config.Config, store *dialogstore.Store
 			}
 			logPath = path
 		}
-
-		var content string
-		var ex *llm.Exchange
-		runWithConsole(stdin, reader, stdout, store, masker, func() {
-			content, ex, err = client.Complete(ctx, model, fullMessages, llmOpts, onRequest)
-		})
-		if err != nil {
-			fmt.Fprintln(stdout, masker.Mask(err.Error()))
-			if ctx.Err() != nil {
-				resultCh <- dialogResult{}
-				return
-			}
-			continue
+		content, ex, reqErr = client.Complete(pctx, model, fullMessages, llmOpts, onRequest)
+	})
+	if paused {
+		saveTaskState(store, dialogID, phaseExecution, promptFile, extra, stdout)
+		return turnPaused
+	}
+	if reqErr != nil {
+		fmt.Fprintln(stdout, masker.Mask(reqErr.Error()))
+		if ctx.Err() != nil {
+			return turnExit
 		}
+		return turnDone
+	}
 
+	// --- validation ---
+	var facts []dialogstore.Fact
+	paused = runPhase(ctx, stdin, reader, stdout, store, masker, phaseValidation, func(_ context.Context) {
 		if stickyFacts {
-			var facts []dialogstore.Fact
 			content, facts = extractFacts(content)
-			if store != nil {
-				saveFacts(store, dialogID, facts, stdout)
-			}
+		}
+	})
+	if paused {
+		saveTaskState(store, dialogID, phaseValidation, promptFile, extra, stdout)
+		return turnPaused
+	}
+
+	// --- done ---
+	runPhase(ctx, stdin, reader, stdout, store, masker, phaseDone, func(_ context.Context) {
+		if stickyFacts && store != nil {
+			saveFacts(store, dialogID, facts, stdout)
 		}
 
 		fmt.Fprintln(stdout)
 		fmt.Fprintln(stdout, colorize(stdout, ansiGreen, masker.Mask(content)))
 
-		dialogPromptTotal += ex.PromptTokens
-		dialogCompletionTotal += ex.CompletionTokens
+		*dialogPromptTotal += ex.PromptTokens
+		*dialogCompletionTotal += ex.CompletionTokens
 		fmt.Fprintln(stdout)
 		fmt.Fprintf(stdout, "prompt_tokens: %d, completion_tokens: %d\n", ex.PromptTokens, ex.CompletionTokens)
-		fmt.Fprintf(stdout, "dialog prompt_tokens: %d, dialog completion_tokens: %d\n", dialogPromptTotal, dialogCompletionTotal)
+		fmt.Fprintf(stdout, "dialog prompt_tokens: %d, dialog completion_tokens: %d\n", *dialogPromptTotal, *dialogCompletionTotal)
 		fmt.Fprintf(stdout, "время выполнения: %.2fs\n", ex.Duration.Seconds())
 
 		if logPath != "" {
@@ -272,11 +358,11 @@ func runDialog(ctx context.Context, cfg *config.Config, store *dialogstore.Store
 		}
 
 		// This turn's messages plus the reply enrich the dialog's context
-		// for its next turn, and are persisted per CLAUDE.md — prompt_tokens
-		// on the request-side rows, completion_tokens on the reply's row.
-		// parentID is only non-empty for a freshly forked branch (see
-		// selectBranch), and is then stamped on every row of that branch,
-		// same as model.
+		// for its next turn, and are persisted per CLAUDE.md —
+		// prompt_tokens on the request-side rows, completion_tokens on
+		// the reply's row. parentID is only non-empty for a freshly
+		// forked branch (see selectBranch), and is then stamped on every
+		// row of that branch, same as model.
 		if store != nil {
 			promptTokens := ex.PromptTokens
 			for _, m := range turnMessages {
@@ -290,10 +376,13 @@ func runDialog(ctx context.Context, cfg *config.Config, store *dialogstore.Store
 			}
 		}
 		for _, m := range turnMessages {
-			appendDialogContext(&dialogContext, m.Role, m.Content)
+			appendDialogContext(dialogContext, m.Role, m.Content)
 		}
-		appendDialogContext(&dialogContext, "assistant", content)
-	}
+		appendDialogContext(dialogContext, "assistant", content)
+
+		clearTaskState(store, dialogID, stdout)
+	})
+	return turnDone
 }
 
 // dialogSelection is selectDialog's result.

@@ -65,6 +65,13 @@ CREATE TABLE IF NOT EXISTS agent (
 	profile    TEXT NOT NULL DEFAULT '',
 	invariants TEXT NOT NULL DEFAULT '',
 	updated_at DATETIME NOT NULL
+);
+CREATE TABLE IF NOT EXISTS task_state (
+	dialog_id   TEXT PRIMARY KEY,
+	phase       TEXT NOT NULL,
+	prompt_file TEXT NOT NULL DEFAULT '',
+	extra       TEXT NOT NULL DEFAULT '',
+	updated_at  DATETIME NOT NULL
 );`
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
@@ -294,6 +301,51 @@ func (s *Store) Agent() (profile, invariants string, err error) {
 		return "", "", fmt.Errorf("load agent: %w", err)
 	}
 	return profile, invariants, nil
+}
+
+// SaveTaskState records dialogID's "### State Machine" progress — CLAUDE.md:
+// "Пользователь должен иметь возможность поставить паузу на любом из
+// этапов - команда /pause. Это приводит к сохранению текущего состояния в
+// базу данных." promptFile and extra are the paused turn's Step A/Step T
+// inputs, so /resume can rebuild the same request; phase is which state
+// machine step ("planning"/"execution"/"validation"/"done") it was
+// paused at, kept for display only.
+func (s *Store) SaveTaskState(dialogID, phase, promptFile, extra string) error {
+	_, err := s.db.Exec(
+		`INSERT INTO task_state (dialog_id, phase, prompt_file, extra, updated_at) VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(dialog_id) DO UPDATE SET phase = excluded.phase, prompt_file = excluded.prompt_file, extra = excluded.extra, updated_at = excluded.updated_at`,
+		dialogID, phase, promptFile, extra, time.Now().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("save task state: %w", err)
+	}
+	return nil
+}
+
+// TaskState returns dialogID's saved pause state, if any — CLAUDE.md's
+// "/resume - приводит к возобновлению процесса с того шага на котором мы
+// закончили". ok is false when nothing is paused for this dialog.
+func (s *Store) TaskState(dialogID string) (phase, promptFile, extra string, ok bool, err error) {
+	err = s.db.QueryRow(
+		`SELECT phase, prompt_file, extra FROM task_state WHERE dialog_id = ?`, dialogID,
+	).Scan(&phase, &promptFile, &extra)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", "", false, nil
+	}
+	if err != nil {
+		return "", "", "", false, fmt.Errorf("load task state: %w", err)
+	}
+	return phase, promptFile, extra, true, nil
+}
+
+// ClearTaskState removes dialogID's saved pause state, if any — called
+// once a turn actually completes (successfully or not) so a stale pause
+// can't be resumed into a dialog that has since moved on.
+func (s *Store) ClearTaskState(dialogID string) error {
+	if _, err := s.db.Exec(`DELETE FROM task_state WHERE dialog_id = ?`, dialogID); err != nil {
+		return fmt.Errorf("clear task state: %w", err)
+	}
+	return nil
 }
 
 // DialogSummary identifies one existing dialog for Step D's selection list
