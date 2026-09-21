@@ -12,22 +12,30 @@ import (
 // CLAUDE.md's "### Команды в консоле": "/profile - выводит текущий
 // активный профайл", "/pause - пауза в работе агента", "/resume -
 // возобновление работы агента с сохраненного шага", "/invariants -
-// выводит текущие инварианты". /pause and /resume have control-flow
-// effects (aborting/replaying a turn) beyond printing something, so
-// they're recognized separately — isPauseCommand/isResumeCommand below,
-// checked by phase.go's runPhase and by runDialog's Step T handling —
-// rather than through consoleCommand, which only ever prints and returns.
+// выводит текущие инварианты", "/planning - возвращает агента на этап
+// планирвоания (если это разрешено)", "/validation - возвращает агента
+// на этап валидации (если это разрешено)". /pause, /resume, /planning and
+// /validation all have control-flow effects (aborting/replaying/jumping a
+// turn) beyond printing something, so they're recognized separately —
+// the isXCommand helpers below, checked by phase.go's runPhase and by
+// runDialog's Step T handling — rather than through consoleCommand, which
+// only ever prints and returns.
 const (
 	cmdProfile    = "/profile"
 	cmdPause      = "/pause"
 	cmdResume     = "/resume"
 	cmdInvariants = "/invariants"
+	cmdPlanning   = "/planning"
+	cmdValidation = "/validation"
 )
 
-// isPauseCommand and isResumeCommand report whether s (case-insensitively,
-// surrounding whitespace ignored) is that command.
-func isPauseCommand(s string) bool  { return strings.EqualFold(strings.TrimSpace(s), cmdPause) }
-func isResumeCommand(s string) bool { return strings.EqualFold(strings.TrimSpace(s), cmdResume) }
+// isPauseCommand, isResumeCommand, isPlanningCommand and isValidationCommand
+// report whether s (case-insensitively, surrounding whitespace ignored) is
+// that command.
+func isPauseCommand(s string) bool      { return strings.EqualFold(strings.TrimSpace(s), cmdPause) }
+func isResumeCommand(s string) bool     { return strings.EqualFold(strings.TrimSpace(s), cmdResume) }
+func isPlanningCommand(s string) bool   { return strings.EqualFold(strings.TrimSpace(s), cmdPlanning) }
+func isValidationCommand(s string) bool { return strings.EqualFold(strings.TrimSpace(s), cmdValidation) }
 
 // consoleCommand recognizes and runs a print-only console command typed as
 // line (case-insensitively, surrounding whitespace ignored), reporting

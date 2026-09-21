@@ -194,6 +194,10 @@ func runDialog(ctx context.Context, cfg *config.Config, store *dialogstore.Store
 			fmt.Fprintln(stdout, "нет выполняющейся задачи — приостанавливать нечего")
 			continue
 		}
+		if isPlanningCommand(extra) || isValidationCommand(extra) {
+			fmt.Fprintln(stdout, "нет выполняющейся задачи — переход невозможен")
+			continue
+		}
 		if isResumeCommand(extra) {
 			savedPhase, savedFile, savedExtra, has := loadTaskState(store, dialogID, stdout)
 			if !has {
@@ -225,165 +229,212 @@ func runDialog(ctx context.Context, cfg *config.Config, store *dialogstore.Store
 
 // runTurn drives one Step T submission through CLAUDE.md's "### State
 // Machine": planning → execution → validation → done, each phase printed
-// explicitly and pausable via "/pause" (see runPhase). Pausing at any
-// phase saves just enough to redo the turn later via "/resume" — the
-// selected prompt file and Step T's typed text (CLAUDE.md's "###
-// Команды в консоле") — since only the planning phase is idempotent;
-// execution's result is never persisted mid-flight, so resuming past
-// planning always re-sends the request rather than replaying a stored
-// reply.
+// explicitly and pausable via "/pause" (see runPhase). CLAUDE.md also
+// allows jumping backward — "execution -> planning, validation ->
+// planning, done -> validation, done -> planning" — via "/planning" and
+// "/validation" (see extraJumps), which this drives as an actual state
+// loop rather than a straight-line sequence: a jump just sets phase to
+// the target and the switch below re-enters it, reusing whatever earlier
+// phases already computed (e.g. a validation -> planning jump discards
+// nothing that planning itself will recompute).
+//
+// Pausing at any phase saves just enough to redo the turn later via
+// "/resume" — the selected prompt file and Step T's typed text
+// (CLAUDE.md's "### Команды в консоле") — since only the planning phase
+// is idempotent; execution's result is never persisted mid-flight, so
+// resuming past planning always re-sends the request rather than
+// replaying a stored reply.
 func runTurn(ctx context.Context, cfg *config.Config, store *dialogstore.Store, masker *secretmask.Masker, stdin *os.File, reader *bufio.Reader, stdout io.Writer, opts Options, dialogID, parentID string, tmpl *promptfile.Prompt, promptFile, extra string, dialogContext *string, dialogPromptTotal, dialogCompletionTotal *int) turnOutcome {
 	stickyFacts := strings.EqualFold(cfg.ContextStrategy, config.ContextStrategyStickyFacts)
 
-	// --- planning ---
 	var turnMessages []llm.Message
 	var model string
 	var llmOpts llm.Options
 	var client *llm.Client
 	var fullMessages []llm.Message
-	var planErr error
 
-	paused := runPhase(ctx, stdin, reader, stdout, store, masker, phasePlanning, func(_ context.Context) {
-		turnMessages, model, llmOpts = assembleRequest(tmpl, defaultModel, extra)
-		if len(turnMessages) == 0 {
-			planErr = errNothingToSend
-			return
-		}
-		client, planErr = resolveClient(model, cfg)
-		if planErr != nil {
-			return
-		}
-		if opts.ResponseTimeout != nil {
-			client.HTTPClient.Timeout = *opts.ResponseTimeout
-		}
-
-		// The dialog's history so far is folded into one system message
-		// (CLAUDE.md's Step D: "обогатить ей system prompt"), ahead of
-		// this turn's own messages. CONTEXT_STRATEGY=STICKY_FACTS adds a
-		// system message of previously extracted facts too, plus an
-		// instruction (after the turn's own messages) telling the model
-		// to extract new facts into a dedicated section of its reply.
-		fullMessages = make([]llm.Message, 0, len(turnMessages)+3)
-		for _, ac := range agentContext(store, stdout) {
-			fullMessages = append(fullMessages, llm.Message{Role: "system", Content: ac})
-		}
-		if stickyFacts {
-			if fc := factsContext(store, dialogID, stdout); fc != "" {
-				fullMessages = append(fullMessages, llm.Message{Role: "system", Content: fc})
-			}
-		}
-		if *dialogContext != "" {
-			fullMessages = append(fullMessages, llm.Message{Role: "system", Content: *dialogContext})
-		}
-		fullMessages = append(fullMessages, turnMessages...)
-		if stickyFacts {
-			fullMessages = append(fullMessages, llm.Message{Role: "system", Content: factsInstruction})
-		}
-	})
-	if paused {
-		saveTaskState(store, dialogID, phasePlanning, promptFile, extra, stdout)
-		return turnPaused
-	}
-	if planErr != nil {
-		fmt.Fprintln(stdout, masker.Mask(planErr.Error()))
-		return turnDone
-	}
-
-	// --- execution ---
 	// The request must be logged right before it is sent (CLAUDE.md), not
 	// only once the response comes back — so the log file is started from
 	// inside Complete, right before the HTTP call.
 	var logPath string
 	var content string
 	var ex *llm.Exchange
-	var reqErr error
-
-	paused = runPhase(ctx, stdin, reader, stdout, store, masker, phaseExecution, func(pctx context.Context) {
-		onRequest := func(reqBody []byte) {
-			path, logErr := exchangelog.Start(exchangelog.Dir, model, reqBody, masker)
-			if logErr != nil {
-				fmt.Fprintln(stdout, "не удалось записать лог:", masker.Mask(logErr.Error()))
-				return
-			}
-			logPath = path
-		}
-		content, ex, reqErr = client.Complete(pctx, model, fullMessages, llmOpts, onRequest)
-	})
-	if paused {
-		saveTaskState(store, dialogID, phaseExecution, promptFile, extra, stdout)
-		return turnPaused
-	}
-	if reqErr != nil {
-		fmt.Fprintln(stdout, masker.Mask(reqErr.Error()))
-		if ctx.Err() != nil {
-			return turnExit
-		}
-		return turnDone
-	}
-
-	// --- validation ---
 	var facts []dialogstore.Fact
-	paused = runPhase(ctx, stdin, reader, stdout, store, masker, phaseValidation, func(pctx context.Context) {
-		if stickyFacts {
-			content, facts = extractFacts(content)
-		}
-		validateInvariants(pctx, store, client, model, content, masker, stdout)
-	})
-	if paused {
-		saveTaskState(store, dialogID, phaseValidation, promptFile, extra, stdout)
-		return turnPaused
-	}
 
-	// --- done ---
-	runPhase(ctx, stdin, reader, stdout, store, masker, phaseDone, func(_ context.Context) {
-		if stickyFacts && store != nil {
-			saveFacts(store, dialogID, facts, stdout)
-		}
+	// recorded guards done's persistence (dialog history, token totals,
+	// the request log's response half) against a repeat visit that didn't
+	// go through execution again — e.g. "done -> validation -> done" to
+	// re-check invariants: the same reply shouldn't be appended to dialog
+	// history twice. It's reset whenever execution reruns.
+	recorded := false
 
-		fmt.Fprintln(stdout)
-		fmt.Fprintln(stdout, colorize(stdout, ansiGreen, masker.Mask(content)))
-
-		*dialogPromptTotal += ex.PromptTokens
-		*dialogCompletionTotal += ex.CompletionTokens
-		fmt.Fprintln(stdout)
-		fmt.Fprintf(stdout, "prompt_tokens: %d, completion_tokens: %d\n", ex.PromptTokens, ex.CompletionTokens)
-		fmt.Fprintf(stdout, "dialog prompt_tokens: %d, dialog completion_tokens: %d\n", *dialogPromptTotal, *dialogCompletionTotal)
-		fmt.Fprintf(stdout, "время выполнения: %.2fs\n", ex.Duration.Seconds())
-
-		if logPath != "" {
-			if err := exchangelog.Finish(logPath, ex.StatusCode, ex.ResponseBody, ex.Duration, masker); err != nil {
-				fmt.Fprintln(stdout, "не удалось дописать лог:", masker.Mask(err.Error()))
-			} else {
-				fmt.Fprintln(stdout, "лог:", logPath)
-			}
-		}
-
-		// This turn's messages plus the reply enrich the dialog's context
-		// for its next turn, and are persisted per CLAUDE.md —
-		// prompt_tokens on the request-side rows, completion_tokens on
-		// the reply's row. parentID is only non-empty for a freshly
-		// forked branch (see selectBranch), and is then stamped on every
-		// row of that branch, same as model.
-		if store != nil {
-			promptTokens := ex.PromptTokens
-			for _, m := range turnMessages {
-				if err := store.AppendMessage(dialogID, m.Role, m.Content, model, parentID, &promptTokens, nil); err != nil {
-					fmt.Fprintln(stdout, "не удалось сохранить сообщение диалога:", err)
+	phase := phasePlanning
+	for {
+		switch phase {
+		case phasePlanning:
+			var planErr error
+			paused, jump := runPhase(ctx, stdin, reader, stdout, store, masker, phasePlanning, func(_ context.Context) {
+				turnMessages, model, llmOpts = assembleRequest(tmpl, defaultModel, extra)
+				if len(turnMessages) == 0 {
+					planErr = errNothingToSend
+					return
 				}
-			}
-			completionTokens := ex.CompletionTokens
-			if err := store.AppendMessage(dialogID, "assistant", content, model, parentID, nil, &completionTokens); err != nil {
-				fmt.Fprintln(stdout, "не удалось сохранить сообщение диалога:", err)
-			}
-		}
-		for _, m := range turnMessages {
-			appendDialogContext(dialogContext, m.Role, m.Content)
-		}
-		appendDialogContext(dialogContext, "assistant", content)
+				client, planErr = resolveClient(model, cfg)
+				if planErr != nil {
+					return
+				}
+				if opts.ResponseTimeout != nil {
+					client.HTTPClient.Timeout = *opts.ResponseTimeout
+				}
 
-		clearTaskState(store, dialogID, stdout)
-	})
-	return turnDone
+				// The dialog's history so far is folded into one system
+				// message (CLAUDE.md's Step D: "обогатить ей system
+				// prompt"), ahead of this turn's own messages.
+				// CONTEXT_STRATEGY=STICKY_FACTS adds a system message of
+				// previously extracted facts too, plus an instruction
+				// (after the turn's own messages) telling the model to
+				// extract new facts into a dedicated section of its reply.
+				fullMessages = make([]llm.Message, 0, len(turnMessages)+3)
+				for _, ac := range agentContext(store, stdout) {
+					fullMessages = append(fullMessages, llm.Message{Role: "system", Content: ac})
+				}
+				if stickyFacts {
+					if fc := factsContext(store, dialogID, stdout); fc != "" {
+						fullMessages = append(fullMessages, llm.Message{Role: "system", Content: fc})
+					}
+				}
+				if *dialogContext != "" {
+					fullMessages = append(fullMessages, llm.Message{Role: "system", Content: *dialogContext})
+				}
+				fullMessages = append(fullMessages, turnMessages...)
+				if stickyFacts {
+					fullMessages = append(fullMessages, llm.Message{Role: "system", Content: factsInstruction})
+				}
+			})
+			if paused {
+				saveTaskState(store, dialogID, phasePlanning, promptFile, extra, stdout)
+				return turnPaused
+			}
+			if jump != "" {
+				phase = jump
+				continue
+			}
+			if planErr != nil {
+				fmt.Fprintln(stdout, masker.Mask(planErr.Error()))
+				return turnDone
+			}
+			phase = phaseExecution
+
+		case phaseExecution:
+			var reqErr error
+			paused, jump := runPhase(ctx, stdin, reader, stdout, store, masker, phaseExecution, func(pctx context.Context) {
+				recorded = false
+				onRequest := func(reqBody []byte) {
+					path, logErr := exchangelog.Start(exchangelog.Dir, model, reqBody, masker)
+					if logErr != nil {
+						fmt.Fprintln(stdout, "не удалось записать лог:", masker.Mask(logErr.Error()))
+						return
+					}
+					logPath = path
+				}
+				content, ex, reqErr = client.Complete(pctx, model, fullMessages, llmOpts, onRequest)
+			})
+			if paused {
+				saveTaskState(store, dialogID, phaseExecution, promptFile, extra, stdout)
+				return turnPaused
+			}
+			if jump != "" {
+				phase = jump
+				continue
+			}
+			if reqErr != nil {
+				fmt.Fprintln(stdout, masker.Mask(reqErr.Error()))
+				if ctx.Err() != nil {
+					return turnExit
+				}
+				return turnDone
+			}
+			phase = phaseValidation
+
+		case phaseValidation:
+			paused, jump := runPhase(ctx, stdin, reader, stdout, store, masker, phaseValidation, func(pctx context.Context) {
+				if stickyFacts {
+					content, facts = extractFacts(content)
+				}
+				validateInvariants(pctx, store, client, model, content, masker, stdout)
+			})
+			if paused {
+				saveTaskState(store, dialogID, phaseValidation, promptFile, extra, stdout)
+				return turnPaused
+			}
+			if jump != "" {
+				phase = jump
+				continue
+			}
+			phase = phaseDone
+
+		case phaseDone:
+			_, jump := runPhase(ctx, stdin, reader, stdout, store, masker, phaseDone, func(_ context.Context) {
+				if recorded {
+					return
+				}
+				recorded = true
+
+				if stickyFacts && store != nil {
+					saveFacts(store, dialogID, facts, stdout)
+				}
+
+				fmt.Fprintln(stdout)
+				fmt.Fprintln(stdout, colorize(stdout, ansiGreen, masker.Mask(content)))
+
+				*dialogPromptTotal += ex.PromptTokens
+				*dialogCompletionTotal += ex.CompletionTokens
+				fmt.Fprintln(stdout)
+				fmt.Fprintf(stdout, "prompt_tokens: %d, completion_tokens: %d\n", ex.PromptTokens, ex.CompletionTokens)
+				fmt.Fprintf(stdout, "dialog prompt_tokens: %d, dialog completion_tokens: %d\n", *dialogPromptTotal, *dialogCompletionTotal)
+				fmt.Fprintf(stdout, "время выполнения: %.2fs\n", ex.Duration.Seconds())
+
+				if logPath != "" {
+					if err := exchangelog.Finish(logPath, ex.StatusCode, ex.ResponseBody, ex.Duration, masker); err != nil {
+						fmt.Fprintln(stdout, "не удалось дописать лог:", masker.Mask(err.Error()))
+					} else {
+						fmt.Fprintln(stdout, "лог:", logPath)
+					}
+				}
+
+				// This turn's messages plus the reply enrich the dialog's
+				// context for its next turn, and are persisted per
+				// CLAUDE.md — prompt_tokens on the request-side rows,
+				// completion_tokens on the reply's row. parentID is only
+				// non-empty for a freshly forked branch (see
+				// selectBranch), and is then stamped on every row of that
+				// branch, same as model.
+				if store != nil {
+					promptTokens := ex.PromptTokens
+					for _, m := range turnMessages {
+						if err := store.AppendMessage(dialogID, m.Role, m.Content, model, parentID, &promptTokens, nil); err != nil {
+							fmt.Fprintln(stdout, "не удалось сохранить сообщение диалога:", err)
+						}
+					}
+					completionTokens := ex.CompletionTokens
+					if err := store.AppendMessage(dialogID, "assistant", content, model, parentID, nil, &completionTokens); err != nil {
+						fmt.Fprintln(stdout, "не удалось сохранить сообщение диалога:", err)
+					}
+				}
+				for _, m := range turnMessages {
+					appendDialogContext(dialogContext, m.Role, m.Content)
+				}
+				appendDialogContext(dialogContext, "assistant", content)
+
+				clearTaskState(store, dialogID, stdout)
+			})
+			if jump != "" {
+				phase = jump
+				continue
+			}
+			return turnDone
+		}
+	}
 }
 
 // dialogSelection is selectDialog's result.
