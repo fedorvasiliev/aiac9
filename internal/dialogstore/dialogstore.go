@@ -59,6 +59,12 @@ CREATE TABLE IF NOT EXISTS facts (
 	value      TEXT NOT NULL,
 	updated_at DATETIME NOT NULL,
 	PRIMARY KEY (dialog_id, key)
+);
+CREATE TABLE IF NOT EXISTS agent (
+	id         INTEGER PRIMARY KEY CHECK (id = 1),
+	profile    TEXT NOT NULL DEFAULT '',
+	invariants TEXT NOT NULL DEFAULT '',
+	updated_at DATETIME NOT NULL
 );`
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
@@ -243,6 +249,51 @@ func (s *Store) Facts(dialogID string) ([]Fact, error) {
 		facts = append(facts, f)
 	}
 	return facts, rows.Err()
+}
+
+// SetAgentProfile creates or overwrites the agent's saved profile —
+// CLAUDE.md's promptfile "Profile" heading: "текущий профиль сохраняется в
+// таблицу Agent в поле Profile и применяется ко всем задачам которые
+// решает агент". The single row (id=1) is shared by every dialog; its
+// invariants column is left untouched.
+func (s *Store) SetAgentProfile(profile string) error {
+	_, err := s.db.Exec(
+		`INSERT INTO agent (id, profile, invariants, updated_at) VALUES (1, ?, '', ?)
+		 ON CONFLICT(id) DO UPDATE SET profile = excluded.profile, updated_at = excluded.updated_at`,
+		profile, time.Now().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("save agent profile: %w", err)
+	}
+	return nil
+}
+
+// SetAgentInvariants creates or overwrites the agent's saved invariants —
+// CLAUDE.md's promptfile "Invariants" heading, applied the same way as
+// SetAgentProfile but to the invariants column.
+func (s *Store) SetAgentInvariants(invariants string) error {
+	_, err := s.db.Exec(
+		`INSERT INTO agent (id, profile, invariants, updated_at) VALUES (1, '', ?, ?)
+		 ON CONFLICT(id) DO UPDATE SET invariants = excluded.invariants, updated_at = excluded.updated_at`,
+		invariants, time.Now().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("save agent invariants: %w", err)
+	}
+	return nil
+}
+
+// Agent returns the agent's saved profile and invariants, or "" for either
+// that has never been set.
+func (s *Store) Agent() (profile, invariants string, err error) {
+	err = s.db.QueryRow(`SELECT profile, invariants FROM agent WHERE id = 1`).Scan(&profile, &invariants)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", nil
+	}
+	if err != nil {
+		return "", "", fmt.Errorf("load agent: %w", err)
+	}
+	return profile, invariants, nil
 }
 
 // DialogSummary identifies one existing dialog for Step D's selection list

@@ -5,10 +5,10 @@
 // A template is a plain-text file with Markdown-style headings ("# Header",
 // "## Header", ...); everything up to the next heading (or EOF) is that
 // heading's value. Recognized headings: Model, System prompt, User prompt,
-// Response format, Words limit, Stop, Temperature — matched case-insensitively, so
-// "### User Prompt" and "### user prompt" are equivalent. A file with no
-// heading at all is treated as a single implicit User prompt holding the
-// whole file.
+// Response format, Words limit, Stop, Temperature, Profile, Invariants —
+// matched case-insensitively, so "### User Prompt" and "### user prompt"
+// are equivalent. A file with no heading at all is treated as a single
+// implicit User prompt holding the whole file.
 package promptfile
 
 import (
@@ -30,6 +30,8 @@ const (
 	HeaderWordsLimit     = "Words limit"
 	HeaderStop           = "Stop"
 	HeaderTemperature    = "Temperature"
+	HeaderProfile        = "Profile"
+	HeaderInvariants     = "Invariants"
 )
 
 // Section is one heading and its value, in the order parsed from the file.
@@ -115,9 +117,18 @@ func parse(text string) *Prompt {
 }
 
 // isScalar reports whether header holds a single value rather than
-// free-form message text — everything except System/User prompt.
+// free-form message text — everything except System/User prompt, Profile
+// and Invariants, which hold paragraphs of the same kind.
 func isScalar(header string) bool {
-	return !strings.EqualFold(header, HeaderSystemPrompt) && !strings.EqualFold(header, HeaderUserPrompt)
+	switch {
+	case strings.EqualFold(header, HeaderSystemPrompt),
+		strings.EqualFold(header, HeaderUserPrompt),
+		strings.EqualFold(header, HeaderProfile),
+		strings.EqualFold(header, HeaderInvariants):
+		return false
+	default:
+		return true
+	}
 }
 
 // firstLine returns s up to its first newline, trimmed.

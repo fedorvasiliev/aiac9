@@ -161,6 +161,7 @@ func runDialog(ctx context.Context, cfg *config.Config, store *dialogstore.Store
 				continue
 			}
 			printPromptTable(stdout, tmpl)
+			saveAgentFields(store, tmpl, stdout)
 		}
 
 		extra, ok := inputStep(reader, stdout, "Дополнить user prompt и отправить")
@@ -198,6 +199,9 @@ func runDialog(ctx context.Context, cfg *config.Config, store *dialogstore.Store
 		// instruction (after the turn's own messages) telling the model to
 		// extract new facts into a dedicated section of its reply.
 		fullMessages := make([]llm.Message, 0, len(turnMessages)+3)
+		for _, ac := range agentContext(store, stdout) {
+			fullMessages = append(fullMessages, llm.Message{Role: "system", Content: ac})
+		}
 		if stickyFacts {
 			if fc := factsContext(store, dialogID, stdout); fc != "" {
 				fullMessages = append(fullMessages, llm.Message{Role: "system", Content: fc})
