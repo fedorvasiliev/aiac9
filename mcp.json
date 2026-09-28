@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "calc": {
+      "type": "http",
+      "url": "http://127.0.0.1:8081/mcp"
+    },
+    "notes": {
+      "type": "http",
+      "url": "http://127.0.0.1:8082/mcp"
+    }
+  }
+}

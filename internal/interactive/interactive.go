@@ -23,8 +23,8 @@ import (
 
 	"github.com/fedorvasiliev/aiac9/internal/config"
 	"github.com/fedorvasiliev/aiac9/internal/dialogstore"
-	"github.com/fedorvasiliev/aiac9/internal/exchangelog"
 	"github.com/fedorvasiliev/aiac9/internal/llm"
+	"github.com/fedorvasiliev/aiac9/internal/mcp"
 	"github.com/fedorvasiliev/aiac9/internal/promptfile"
 	"github.com/fedorvasiliev/aiac9/internal/secretmask"
 )
@@ -90,13 +90,25 @@ func Run(ctx context.Context, cfg *config.Config, stdin *os.File, stdout io.Writ
 		defer store.Close()
 	}
 
+	// CLAUDE.md's "## Работа с MCP": connect every configured server once,
+	// up front — a missing config file (mcp.LoadConfig) or one server
+	// failing to start (mcp.Connect) is not fatal, same graceful
+	// degradation as a missing dialog store above.
+	mcpCfg, err := mcp.LoadConfig(mcp.DefaultConfigPath)
+	if err != nil {
+		fmt.Fprintln(stdout, "не удалось прочитать конфигурацию MCP:", err)
+		mcpCfg = &mcp.Config{}
+	}
+	registry := mcp.Connect(ctx, mcpCfg, stdout)
+	defer registry.Close()
+
 	for {
 		if ctx.Err() != nil {
 			return nil
 		}
 
 		resultCh := make(chan dialogResult, 1)
-		go runDialog(ctx, cfg, store, masker, stdin, reader, stdout, opts, resultCh)
+		go runDialog(ctx, cfg, store, masker, stdin, reader, stdout, opts, registry, resultCh)
 
 		result := <-resultCh
 		if result.err != nil {
@@ -139,7 +151,7 @@ func isNewDialogCommand(extra string) bool {
 // digest so each new request carries the prior turns as context
 // (CLAUDE.md's "## Диалоги" and "Шаг D"). It sends exactly one
 // dialogResult to resultCh before returning.
-func runDialog(ctx context.Context, cfg *config.Config, store *dialogstore.Store, masker *secretmask.Masker, stdin *os.File, reader *bufio.Reader, stdout io.Writer, opts Options, resultCh chan<- dialogResult) {
+func runDialog(ctx context.Context, cfg *config.Config, store *dialogstore.Store, masker *secretmask.Masker, stdin *os.File, reader *bufio.Reader, stdout io.Writer, opts Options, registry *mcp.Registry, resultCh chan<- dialogResult) {
 	sel := selectDialog(ctx, cfg, store, stdin, reader, stdout)
 	if !sel.ok {
 		resultCh <- dialogResult{}
@@ -219,7 +231,7 @@ func runDialog(ctx context.Context, cfg *config.Config, store *dialogstore.Store
 			continue
 		}
 
-		switch runTurn(ctx, cfg, store, masker, stdin, reader, stdout, opts, dialogID, parentID, tmpl, promptFile, extra, &dialogContext, &dialogPromptTotal, &dialogCompletionTotal) {
+		switch runTurn(ctx, cfg, store, masker, stdin, reader, stdout, opts, registry, dialogID, parentID, tmpl, promptFile, extra, &dialogContext, &dialogPromptTotal, &dialogCompletionTotal) {
 		case turnExit:
 			resultCh <- dialogResult{}
 			return
@@ -244,7 +256,7 @@ func runDialog(ctx context.Context, cfg *config.Config, store *dialogstore.Store
 // is idempotent; execution's result is never persisted mid-flight, so
 // resuming past planning always re-sends the request rather than
 // replaying a stored reply.
-func runTurn(ctx context.Context, cfg *config.Config, store *dialogstore.Store, masker *secretmask.Masker, stdin *os.File, reader *bufio.Reader, stdout io.Writer, opts Options, dialogID, parentID string, tmpl *promptfile.Prompt, promptFile, extra string, dialogContext *string, dialogPromptTotal, dialogCompletionTotal *int) turnOutcome {
+func runTurn(ctx context.Context, cfg *config.Config, store *dialogstore.Store, masker *secretmask.Masker, stdin *os.File, reader *bufio.Reader, stdout io.Writer, opts Options, registry *mcp.Registry, dialogID, parentID string, tmpl *promptfile.Prompt, promptFile, extra string, dialogContext *string, dialogPromptTotal, dialogCompletionTotal *int) turnOutcome {
 	stickyFacts := strings.EqualFold(cfg.ContextStrategy, config.ContextStrategyStickyFacts)
 
 	var turnMessages []llm.Message
@@ -252,11 +264,6 @@ func runTurn(ctx context.Context, cfg *config.Config, store *dialogstore.Store, 
 	var llmOpts llm.Options
 	var client *llm.Client
 	var fullMessages []llm.Message
-
-	// The request must be logged right before it is sent (CLAUDE.md), not
-	// only once the response comes back — so the log file is started from
-	// inside Complete, right before the HTTP call.
-	var logPath string
 	var content string
 	var ex *llm.Exchange
 	var facts []dialogstore.Fact
@@ -273,11 +280,22 @@ func runTurn(ctx context.Context, cfg *config.Config, store *dialogstore.Store, 
 		switch phase {
 		case phasePlanning:
 			var planErr error
-			paused, jump := runPhase(ctx, stdin, reader, stdout, store, masker, phasePlanning, func(_ context.Context) {
+			paused, jump := runPhase(ctx, stdin, reader, stdout, store, masker, phasePlanning, func(pctx context.Context) {
 				turnMessages, model, llmOpts = assembleRequest(tmpl, defaultModel, extra)
 				if len(turnMessages) == 0 {
 					planErr = errNothingToSend
 					return
+				}
+				// CLAUDE.md's "## Работа с MCP": a "MCP:<server>-><command>"
+				// instruction embedded in a user message is run locally,
+				// right here, and replaced with its result before the
+				// request is ever built — distinct from the model asking
+				// for a tool call at execution time (mcpTools/completeWithTools
+				// below).
+				for i := range turnMessages {
+					if turnMessages[i].Role == "user" {
+						turnMessages[i].Content = expandMCPInstructions(pctx, turnMessages[i].Content, registry, masker, stdout)
+					}
 				}
 				client, planErr = resolveClient(model, cfg)
 				if planErr != nil {
@@ -286,6 +304,7 @@ func runTurn(ctx context.Context, cfg *config.Config, store *dialogstore.Store, 
 				if opts.ResponseTimeout != nil {
 					client.HTTPClient.Timeout = *opts.ResponseTimeout
 				}
+				llmOpts.Tools = mcpTools(registry.Tools())
 
 				// The dialog's history so far is folded into one system
 				// message (CLAUDE.md's Step D: "обогатить ей system
@@ -329,15 +348,7 @@ func runTurn(ctx context.Context, cfg *config.Config, store *dialogstore.Store, 
 			var reqErr error
 			paused, jump := runPhase(ctx, stdin, reader, stdout, store, masker, phaseExecution, func(pctx context.Context) {
 				recorded = false
-				onRequest := func(reqBody []byte) {
-					path, logErr := exchangelog.Start(exchangelog.Dir, model, reqBody, masker)
-					if logErr != nil {
-						fmt.Fprintln(stdout, "не удалось записать лог:", masker.Mask(logErr.Error()))
-						return
-					}
-					logPath = path
-				}
-				content, ex, reqErr = client.Complete(pctx, model, fullMessages, llmOpts, onRequest)
+				content, ex, reqErr = completeWithTools(pctx, client, model, fullMessages, llmOpts, registry, masker, stdout)
 			})
 			if paused {
 				saveTaskState(store, dialogID, phaseExecution, promptFile, extra, stdout)
@@ -393,14 +404,6 @@ func runTurn(ctx context.Context, cfg *config.Config, store *dialogstore.Store, 
 				fmt.Fprintf(stdout, "prompt_tokens: %d, completion_tokens: %d\n", ex.PromptTokens, ex.CompletionTokens)
 				fmt.Fprintf(stdout, "dialog prompt_tokens: %d, dialog completion_tokens: %d\n", *dialogPromptTotal, *dialogCompletionTotal)
 				fmt.Fprintf(stdout, "время выполнения: %.2fs\n", ex.Duration.Seconds())
-
-				if logPath != "" {
-					if err := exchangelog.Finish(logPath, ex.StatusCode, ex.ResponseBody, ex.Duration, masker); err != nil {
-						fmt.Fprintln(stdout, "не удалось дописать лог:", masker.Mask(err.Error()))
-					} else {
-						fmt.Fprintln(stdout, "лог:", logPath)
-					}
-				}
 
 				// This turn's messages plus the reply enrich the dialog's
 				// context for its next turn, and are persisted per

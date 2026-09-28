@@ -32,10 +32,12 @@ const (
 // isPauseCommand, isResumeCommand, isPlanningCommand and isValidationCommand
 // report whether s (case-insensitively, surrounding whitespace ignored) is
 // that command.
-func isPauseCommand(s string) bool      { return strings.EqualFold(strings.TrimSpace(s), cmdPause) }
-func isResumeCommand(s string) bool     { return strings.EqualFold(strings.TrimSpace(s), cmdResume) }
-func isPlanningCommand(s string) bool   { return strings.EqualFold(strings.TrimSpace(s), cmdPlanning) }
-func isValidationCommand(s string) bool { return strings.EqualFold(strings.TrimSpace(s), cmdValidation) }
+func isPauseCommand(s string) bool    { return strings.EqualFold(strings.TrimSpace(s), cmdPause) }
+func isResumeCommand(s string) bool   { return strings.EqualFold(strings.TrimSpace(s), cmdResume) }
+func isPlanningCommand(s string) bool { return strings.EqualFold(strings.TrimSpace(s), cmdPlanning) }
+func isValidationCommand(s string) bool {
+	return strings.EqualFold(strings.TrimSpace(s), cmdValidation)
+}
 
 // consoleCommand recognizes and runs a print-only console command typed as
 // line (case-insensitively, surrounding whitespace ignored), reporting

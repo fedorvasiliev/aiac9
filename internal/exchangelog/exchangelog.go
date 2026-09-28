@@ -19,23 +19,50 @@ const Dir = "logs"
 // отправкой": the request must be on disk before the call goes out, not
 // only after the response comes back. The file name follows the pattern
 // from CLAUDE.md: "<day of month>-<month name>-<24h hour>-<minutes>-
-// <seconds>-<model>.log". It returns the path, to be passed to Finish once
-// the response arrives.
+// <seconds>-<model>.log", which only has second granularity — a tool-call
+// round trip (CLAUDE.md's "## Работа с MCP") can easily make two of these
+// within the same second for the same model, so a second Start call that
+// collides with an existing, still-fresh file gets "-2", "-3", ... spliced
+// in before ".log" rather than silently overwriting CLAUDE.md's "каждая
+// пара запроса и ответа" of the first one. It returns the path, to be
+// passed to Finish once the response arrives.
 func Start(dir, model string, reqBody []byte, masker *secretmask.Masker) (string, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", fmt.Errorf("create log dir: %w", err)
 	}
 
 	now := time.Now()
-	name := fmt.Sprintf("%d-%s-%02d-%02d-%02d-%s.log",
+	base := fmt.Sprintf("%d-%s-%02d-%02d-%02d-%s",
 		now.Day(), now.Month().String(), now.Hour(), now.Minute(), now.Second(), model)
-	path := filepath.Join(dir, name)
 
-	content := fmt.Sprintf("=== REQUEST ===\n%s\n", masker.Mask(string(reqBody)))
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		return "", fmt.Errorf("write log file: %w", err)
+	content := []byte(fmt.Sprintf("=== REQUEST ===\n%s\n", masker.Mask(string(reqBody))))
+
+	const maxAttempts = 1000
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		name := base + ".log"
+		if attempt > 1 {
+			name = fmt.Sprintf("%s-%d.log", base, attempt)
+		}
+		path := filepath.Join(dir, name)
+
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if err != nil {
+			if os.IsExist(err) {
+				continue // this second (or "-N" variant) is already taken; try the next one
+			}
+			return "", fmt.Errorf("create log file: %w", err)
+		}
+		_, writeErr := f.Write(content)
+		closeErr := f.Close()
+		if writeErr != nil {
+			return "", fmt.Errorf("write log file: %w", writeErr)
+		}
+		if closeErr != nil {
+			return "", fmt.Errorf("write log file: %w", closeErr)
+		}
+		return path, nil
 	}
-	return path, nil
+	return "", fmt.Errorf("create log file: %d consecutive names already taken for %q", maxAttempts, base)
 }
 
 // Finish appends the (masked) response, plus the request's total duration

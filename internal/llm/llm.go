@@ -24,10 +24,51 @@ const (
 	responseTimeout = 180 * time.Second
 )
 
-// Message is one chat turn, OpenAI-compatible ("system"/"user"/"assistant").
+// Message is one chat turn, OpenAI-compatible
+// ("system"/"user"/"assistant"/"tool"). ToolCalls is set on an assistant
+// message that requests tool invocations (CLAUDE.md's "## Работа с MCP");
+// Name and ToolCallID are set on the "tool" role message reporting one
+// call's result back, matching the call's ToolCall.ID. Both are omitted
+// from the wire entirely when unused, so a request with no tool-calling in
+// play marshals exactly as before this existed.
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role       string     `json:"role"`
+	Content    string     `json:"content"`
+	Name       string     `json:"name,omitempty"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+}
+
+// ToolCall is one invocation an assistant message requests, OpenAI-style.
+type ToolCall struct {
+	ID       string           `json:"id"`
+	Type     string           `json:"type"` // always "function"
+	Function ToolCallFunction `json:"function"`
+}
+
+// ToolCallFunction names which tool to run and its arguments — Arguments
+// is a JSON object encoded as a string, per the OpenAI-compatible contract
+// both Kimi and DeepSeek follow.
+type ToolCallFunction struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+// Tool describes one callable tool offered to the model in a request —
+// OpenAI-style "tools", populated from an MCP server's advertised tools
+// (see internal/mcp.RegisteredTool).
+type Tool struct {
+	Type     string       `json:"type"` // always "function"
+	Function ToolFunction `json:"function"`
+}
+
+// ToolFunction is a Tool's actual definition: name, description and its
+// parameters as a JSON Schema object (passed through verbatim from the MCP
+// tool's inputSchema — both are JSON Schema, so no translation is needed).
+type ToolFunction struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	Parameters  json.RawMessage `json:"parameters,omitempty"`
 }
 
 // Client calls one provider's chat completions endpoint.
@@ -61,6 +102,7 @@ type request struct {
 	ResponseFormat *responseFormat `json:"response_format,omitempty"`
 	Stop           string          `json:"stop,omitempty"`
 	Temperature    *float64        `json:"temperature,omitempty"`
+	Tools          []Tool          `json:"tools,omitempty"`
 }
 
 type responseFormat struct {
@@ -75,6 +117,7 @@ type Options struct {
 	ResponseFormat string   // -> response_format.type, if non-empty
 	Stop           string   // -> stop, if non-empty
 	Temperature    *float64 // -> temperature, if non-nil
+	Tools          []Tool   // -> tools, if non-empty — CLAUDE.md's "## Работа с MCP"
 }
 
 type response struct {
@@ -113,6 +156,13 @@ type Exchange struct {
 	PromptTokens     int
 	CompletionTokens int
 	TotalTokens      int
+
+	// Message is the raw assistant message the API returned — same as
+	// Complete's own content return in the common case, but this is the
+	// only place a caller can see ToolCalls when the model asks for a
+	// tool invocation instead of a final answer (CLAUDE.md's "## Работа
+	// с MCP").
+	Message Message
 }
 
 // Complete sends messages to model and returns the assistant's reply text
@@ -128,7 +178,7 @@ func (c *Client) Complete(ctx context.Context, model string, messages []Message,
 		return "", nil, fmt.Errorf("API key is not set")
 	}
 
-	req := request{Model: model, Messages: messages, Stop: opts.Stop, Temperature: opts.Temperature}
+	req := request{Model: model, Messages: messages, Stop: opts.Stop, Temperature: opts.Temperature, Tools: opts.Tools}
 	if opts.ResponseFormat != "" {
 		req.ResponseFormat = &responseFormat{Type: opts.ResponseFormat}
 	}
@@ -189,5 +239,6 @@ func (c *Client) Complete(ctx context.Context, model string, messages []Message,
 		return "", ex, fmt.Errorf("api returned no choices")
 	}
 
+	ex.Message = resp.Choices[0].Message
 	return resp.Choices[0].Message.Content, ex, nil
 }
