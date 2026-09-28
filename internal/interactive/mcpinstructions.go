@@ -21,31 +21,130 @@ type mcpInline interface {
 	CallOn(ctx context.Context, server, tool string, arguments json.RawMessage) (text string, isError bool, err error)
 }
 
-// mcpInstructionRe matches CLAUDE.md's "## Работа с MCP" inline syntax:
-// "MCP:calc->tools" or "MCP:calc->add(4, 9)".
-var mcpInstructionRe = regexp.MustCompile(`MCP:([A-Za-z0-9_-]+)->(tools|[A-Za-z0-9_]+\([^)]*\))`)
+// mcpInstrPrefix marks the start of an inline instruction — CLAUDE.md's
+// "## Работа с MCP" inline syntax: "MCP:calc->tools" or
+// "MCP:calc->add(4, 9)".
+const mcpInstrPrefix = "MCP:"
 
-var toolCallRe = regexp.MustCompile(`^([A-Za-z0-9_]+)\(([^)]*)\)$`)
+// serverArrowRe matches a server name followed by "->" in one pattern
+// (rather than two separate steps) so the regex engine's own backtracking
+// resolves the ambiguity between a server name allowed to contain "-" and
+// the "->" delimiter that follows it: greedily matching the name alone
+// would swallow the "-" belonging to "->", leaving only ">" to match
+// against the literal "->" and failing; requiring "->" as part of the
+// same match forces the engine to give that character back.
+var serverArrowRe = regexp.MustCompile(`^([A-Za-z0-9_-]+)->`)
+var toolNameRe = regexp.MustCompile(`^[A-Za-z0-9_]+`)
 
 // expandMCPInstructions replaces every "MCP:<server>-><command>"
 // instruction embedded in content with the result of actually running it
 // locally against a connected MCP server — CLAUDE.md: "Если в User prompt
 // есть инструкции для MCP - необходимо выполнить их локально и заменить в
-// User prompt эти инструкции результатом обращения к mcp". Content with
-// no such instruction is returned unchanged, untouched by the regexp at
-// all.
+// User prompt эти инструкции результатом обращения к mcp". Instructions
+// may nest — "Инструкции вызовов MCP могут быть вложенными" — e.g.
+// "MCP:calc->add(MCP:calc->multiply(2, 3), 9)": a call's own argument
+// text is expanded (innermost first, via recursion) before the call
+// itself runs, so the outer call sees already-resolved arguments. Content
+// with no "MCP:" at all is returned unchanged, without even attempting to
+// parse anything.
+//
+// This can't be done with a single regexp: matching a call's argument
+// list requires counting balanced parentheses, which regular expressions
+// (Go's RE2 included) cannot express for arbitrary nesting depth — so
+// this is a small hand-written scanner instead.
 func expandMCPInstructions(ctx context.Context, content string, registry mcpInline, masker *secretmask.Masker, stdout io.Writer) string {
-	if !strings.Contains(content, "MCP:") {
+	if !strings.Contains(content, mcpInstrPrefix) {
 		return content
 	}
-	return mcpInstructionRe.ReplaceAllStringFunc(content, func(match string) string {
-		m := mcpInstructionRe.FindStringSubmatch(match)
-		server, command := m[1], m[2]
-		if command == "tools" {
-			return mcpExpandToolsList(registry, server, stdout)
+
+	var b strings.Builder
+	i := 0
+	for {
+		idx := strings.Index(content[i:], mcpInstrPrefix)
+		if idx < 0 {
+			b.WriteString(content[i:])
+			break
 		}
-		return mcpExpandToolCall(ctx, registry, server, command, masker, stdout)
-	})
+		start := i + idx
+		b.WriteString(content[i:start])
+
+		end, result, ok := parseAndRunMCPInstruction(ctx, content, start, registry, masker, stdout)
+		if !ok {
+			// Not a well-formed instruction (e.g. a bare "MCP:" with no
+			// valid server->command shape) — emit the prefix literally and
+			// resume searching right after it, so this can't loop forever
+			// on the same spot.
+			b.WriteString(mcpInstrPrefix)
+			i = start + len(mcpInstrPrefix)
+			continue
+		}
+		b.WriteString(result)
+		i = end
+	}
+	return b.String()
+}
+
+// parseAndRunMCPInstruction parses the single instruction starting at
+// content[start:] (which begins with mcpInstrPrefix) and, if well-formed,
+// runs it. end is the index right after the instruction's last consumed
+// character; ok is false if content[start:] doesn't actually form a valid
+// instruction, in which case end/result are meaningless.
+func parseAndRunMCPInstruction(ctx context.Context, content string, start int, registry mcpInline, masker *secretmask.Masker, stdout io.Writer) (end int, result string, ok bool) {
+	rest := content[start+len(mcpInstrPrefix):]
+
+	m := serverArrowRe.FindStringSubmatch(rest)
+	if m == nil {
+		return 0, "", false
+	}
+	server := m[1]
+	pos := len(m[0])
+
+	name := toolNameRe.FindString(rest[pos:])
+	if name == "" {
+		return 0, "", false
+	}
+	afterName := pos + len(name)
+
+	if afterName < len(rest) && rest[afterName] == '(' {
+		closeIdx, balanced := scanBalancedParens(rest, afterName)
+		if !balanced {
+			return 0, "", false
+		}
+		rawArgs := rest[afterName+1 : closeIdx]
+		// Nested instructions resolve first — e.g. in
+		// "add(MCP:calc->multiply(2, 3), 9)" the multiply call must run
+		// (and its result splice in) before add's own arguments are split
+		// and coerced.
+		resolvedArgs := expandMCPInstructions(ctx, rawArgs, registry, masker, stdout)
+		out := mcpRunToolCall(ctx, registry, server, name, resolvedArgs, masker, stdout)
+		return start + len(mcpInstrPrefix) + closeIdx + 1, out, true
+	}
+
+	if name == "tools" {
+		out := mcpListTools(registry, server, stdout)
+		return start + len(mcpInstrPrefix) + afterName, out, true
+	}
+
+	return 0, "", false
+}
+
+// scanBalancedParens finds the index (into s) of the ')' that closes the
+// '(' at s[openIdx], counting nested parentheses so it doesn't stop at
+// the first ')' belonging to a nested call's own argument list.
+func scanBalancedParens(s string, openIdx int) (closeIdx int, ok bool) {
+	depth := 0
+	for i := openIdx; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return i, true
+			}
+		}
+	}
+	return -1, false
 }
 
 // mcpLabel is the yellow "MCP:" prefix used to echo each inline expansion
@@ -54,7 +153,7 @@ func mcpLabel(stdout io.Writer) string {
 	return colorize(stdout, ansiYellow, "MCP:")
 }
 
-func mcpExpandToolsList(registry mcpInline, server string, stdout io.Writer) string {
+func mcpListTools(registry mcpInline, server string, stdout io.Writer) string {
 	tools := registry.ToolsFor(server)
 	if len(tools) == 0 {
 		msg := fmt.Sprintf("[MCP ошибка: сервер %q не подключён или не имеет инструментов]", server)
@@ -77,17 +176,12 @@ func mcpExpandToolsList(registry mcpInline, server string, stdout io.Writer) str
 	return result
 }
 
-func mcpExpandToolCall(ctx context.Context, registry mcpInline, server, callText string, masker *secretmask.Masker, stdout io.Writer) string {
+// mcpRunToolCall runs one already-parsed call: server/toolName plus its
+// argument text, with any nested instructions inside argsText already
+// resolved by the caller.
+func mcpRunToolCall(ctx context.Context, registry mcpInline, server, toolName, argsText string, masker *secretmask.Masker, stdout io.Writer) string {
 	label := mcpLabel(stdout)
-	echo := server + "->" + callText
-
-	m := toolCallRe.FindStringSubmatch(callText)
-	if m == nil {
-		msg := fmt.Sprintf("[MCP ошибка: не удалось разобрать %q]", callText)
-		fmt.Fprintln(stdout, label, echo, "-> ошибка:", msg)
-		return msg
-	}
-	toolName, argsText := m[1], m[2]
+	echo := fmt.Sprintf("%s->%s(%s)", server, toolName, argsText)
 
 	prefix := server + "__"
 	var schema json.RawMessage

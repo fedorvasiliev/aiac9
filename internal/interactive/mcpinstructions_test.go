@@ -163,3 +163,120 @@ func TestOrderedObjectKeys_PreservesDeclarationOrder(t *testing.T) {
 		t.Fatalf("got = %+v, want [z a] (wire order, not sorted)", got)
 	}
 }
+
+// callResultMap is the exact anonymous struct shape fakeInline.callResult
+// uses — named here just to keep the nesting tests below shorter.
+type callResultMap = map[string]struct {
+	text    string
+	isError bool
+	err     error
+}
+
+func TestExpandMCPInstructions_NestedCallResolvesInnermostFirst(t *testing.T) {
+	f := &fakeInline{
+		tools: map[string][]mcp.RegisteredTool{"calc": {
+			{Name: "calc__add", InputSchema: calcSchema()},
+			{Name: "calc__multiply", InputSchema: calcSchema()},
+		}},
+		callResult: callResultMap{
+			"calc__multiply": {text: "6"},
+			"calc__add":      {text: "15"},
+		},
+	}
+	var out bytes.Buffer
+	got := expandMCPInstructions(context.Background(), "Результат: MCP:calc->add(MCP:calc->multiply(2, 3), 9)", f, secretmask.New(), &out)
+	if got != "Результат: 15" {
+		t.Fatalf("got = %q, want the outer call's own result", got)
+	}
+	if len(f.calls) != 2 {
+		t.Fatalf("calls = %+v, want exactly 2 (inner then outer)", f.calls)
+	}
+	if f.calls[0] != `calc__multiply:{"a":2,"b":3}` {
+		t.Fatalf("calls[0] = %q, want the inner multiply to run first", f.calls[0])
+	}
+	if f.calls[1] != `calc__add:{"a":6,"b":9}` {
+		t.Fatalf("calls[1] = %q, want the outer add to see the inner result (6)", f.calls[1])
+	}
+}
+
+func TestExpandMCPInstructions_ThreeLevelsDeep(t *testing.T) {
+	f := &fakeInline{
+		tools: map[string][]mcp.RegisteredTool{"calc": {
+			{Name: "calc__add", InputSchema: calcSchema()},
+			{Name: "calc__subtract", InputSchema: calcSchema()},
+			{Name: "calc__multiply", InputSchema: calcSchema()},
+		}},
+		callResult: callResultMap{
+			"calc__multiply": {text: "6"},  // 2*3
+			"calc__subtract": {text: "1"},  // 6-5
+			"calc__add":      {text: "10"}, // 1+9
+		},
+	}
+	var out bytes.Buffer
+	got := expandMCPInstructions(context.Background(), "MCP:calc->add(MCP:calc->subtract(MCP:calc->multiply(2, 3), 5), 9)", f, secretmask.New(), &out)
+	if got != "10" {
+		t.Fatalf("got = %q", got)
+	}
+	wantCalls := []string{
+		`calc__multiply:{"a":2,"b":3}`,
+		`calc__subtract:{"a":6,"b":5}`,
+		`calc__add:{"a":1,"b":9}`,
+	}
+	if len(f.calls) != len(wantCalls) {
+		t.Fatalf("calls = %+v, want %+v", f.calls, wantCalls)
+	}
+	for i, want := range wantCalls {
+		if f.calls[i] != want {
+			t.Fatalf("calls[%d] = %q, want %q", i, f.calls[i], want)
+		}
+	}
+}
+
+func TestExpandMCPInstructions_NestedAcrossDifferentServers(t *testing.T) {
+	f := &fakeInline{
+		tools: map[string][]mcp.RegisteredTool{
+			"calc":  {{Name: "calc__add", InputSchema: calcSchema()}},
+			"notes": {{Name: "notes__count", InputSchema: []byte(`{"type":"object","properties":{}}`)}},
+		},
+		callResult: callResultMap{
+			"notes__count": {text: "3"},
+			"calc__add":    {text: "13"},
+		},
+	}
+	var out bytes.Buffer
+	got := expandMCPInstructions(context.Background(), "MCP:calc->add(MCP:notes->count(), 10)", f, secretmask.New(), &out)
+	if got != "13" {
+		t.Fatalf("got = %q", got)
+	}
+	if len(f.calls) != 2 || f.calls[0] != "notes__count:{}" || f.calls[1] != `calc__add:{"a":3,"b":10}` {
+		t.Fatalf("calls = %+v", f.calls)
+	}
+}
+
+func TestExpandMCPInstructions_UnbalancedParensIsLeftUnexpanded(t *testing.T) {
+	f := &fakeInline{tools: map[string][]mcp.RegisteredTool{"calc": {{Name: "calc__add", InputSchema: calcSchema()}}}}
+	var out bytes.Buffer
+	got := expandMCPInstructions(context.Background(), "MCP:calc->add(1, 2", f, secretmask.New(), &out)
+	if got != "MCP:calc->add(1, 2" {
+		t.Fatalf("got = %q, want the malformed instruction left untouched", got)
+	}
+	if len(f.calls) != 0 {
+		t.Fatalf("calls = %+v, want none for an unbalanced call", f.calls)
+	}
+}
+
+func TestExpandMCPInstructions_BareCommandWithoutParensIsNotACall(t *testing.T) {
+	// "MCP:scheduler->get_summary" with no "()" doesn't match either
+	// recognized shape ("tools", or "name(args)") and is left as plain
+	// text — CLAUDE.md's examples always show a call with parentheses,
+	// even for a zero-argument tool ("notes->list_notes()").
+	f := &fakeInline{tools: map[string][]mcp.RegisteredTool{"scheduler": {{Name: "scheduler__get_summary"}}}}
+	var out bytes.Buffer
+	got := expandMCPInstructions(context.Background(), "MCP:scheduler->get_summary", f, secretmask.New(), &out)
+	if got != "MCP:scheduler->get_summary" {
+		t.Fatalf("got = %q, want it left unchanged", got)
+	}
+	if len(f.calls) != 0 {
+		t.Fatalf("calls = %+v, want none", f.calls)
+	}
+}
