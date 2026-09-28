@@ -7,6 +7,10 @@
     "notes": {
       "type": "http",
       "url": "http://127.0.0.1:8082/mcp"
+    },
+    "scheduler": {
+      "type": "http",
+      "url": "http://127.0.0.1:8083/mcp"
     }
   }
 }
