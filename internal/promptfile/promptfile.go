@@ -5,10 +5,10 @@
 // A template is a plain-text file with Markdown-style headings ("# Header",
 // "## Header", ...); everything up to the next heading (or EOF) is that
 // heading's value. Recognized headings: Model, System prompt, User prompt,
-// Response format, Words limit, Stop, Temperature, Profile, Invariants —
-// matched case-insensitively, so "### User Prompt" and "### user prompt"
-// are equivalent. A file with no heading at all is treated as a single
-// implicit User prompt holding the whole file.
+// Response format, Words limit, Stop, Temperature, Profile, Invariants,
+// Next Prompt — matched case-insensitively, so "### User Prompt" and
+// "### user prompt" are equivalent. A file with no heading at all is
+// treated as a single implicit User prompt holding the whole file.
 package promptfile
 
 import (
@@ -32,6 +32,7 @@ const (
 	HeaderTemperature    = "Temperature"
 	HeaderProfile        = "Profile"
 	HeaderInvariants     = "Invariants"
+	HeaderNextPrompt     = "Next Prompt"
 )
 
 // Section is one heading and its value, in the order parsed from the file.

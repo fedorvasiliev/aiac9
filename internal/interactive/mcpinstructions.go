@@ -52,36 +52,56 @@ var toolNameRe = regexp.MustCompile(`^[A-Za-z0-9_]+`)
 // list requires counting balanced parentheses, which regular expressions
 // (Go's RE2 included) cannot express for arbitrary nesting depth — so
 // this is a small hand-written scanner instead.
-func expandMCPInstructions(ctx context.Context, content string, registry mcpInline, masker *secretmask.Masker, stdout io.Writer) string {
+//
+// mcpOnly reports whether content, once every instruction is stripped
+// out, had no other non-blank text at all — CLAUDE.md: "Если в User
+// prompt нет никаких инструкций (непустого текста) кроме MCP - выполняем
+// их в полном объеме, но запрос в llm не отправляем". It is false for
+// content with no recognized instruction in it at all (nothing was
+// "выполнено локально"), even if content itself is blank.
+func expandMCPInstructions(ctx context.Context, content string, registry mcpInline, masker *secretmask.Masker, stdout io.Writer) (result string, mcpOnly bool) {
 	if !strings.Contains(content, mcpInstrPrefix) {
-		return content
+		return content, false
 	}
 
 	var b strings.Builder
 	i := 0
+	foundAny := false
+	onlyMCP := true
 	for {
 		idx := strings.Index(content[i:], mcpInstrPrefix)
 		if idx < 0 {
-			b.WriteString(content[i:])
+			tail := content[i:]
+			b.WriteString(tail)
+			if strings.TrimSpace(tail) != "" {
+				onlyMCP = false
+			}
 			break
 		}
 		start := i + idx
-		b.WriteString(content[i:start])
+		gap := content[i:start]
+		b.WriteString(gap)
+		if strings.TrimSpace(gap) != "" {
+			onlyMCP = false
+		}
 
-		end, result, ok := parseAndRunMCPInstruction(ctx, content, start, registry, masker, stdout)
+		end, res, ok := parseAndRunMCPInstruction(ctx, content, start, registry, masker, stdout)
 		if !ok {
 			// Not a well-formed instruction (e.g. a bare "MCP:" with no
 			// valid server->command shape) — emit the prefix literally and
 			// resume searching right after it, so this can't loop forever
-			// on the same spot.
+			// on the same spot. Leftover literal "MCP:" text counts as
+			// "other text", not something handled locally.
 			b.WriteString(mcpInstrPrefix)
 			i = start + len(mcpInstrPrefix)
+			onlyMCP = false
 			continue
 		}
-		b.WriteString(result)
+		b.WriteString(res)
+		foundAny = true
 		i = end
 	}
-	return b.String()
+	return b.String(), foundAny && onlyMCP
 }
 
 // parseAndRunMCPInstruction parses the single instruction starting at
@@ -114,8 +134,10 @@ func parseAndRunMCPInstruction(ctx context.Context, content string, start int, r
 		// Nested instructions resolve first — e.g. in
 		// "add(MCP:calc->multiply(2, 3), 9)" the multiply call must run
 		// (and its result splice in) before add's own arguments are split
-		// and coerced.
-		resolvedArgs := expandMCPInstructions(ctx, rawArgs, registry, masker, stdout)
+		// and coerced. Whether the argument text itself was "MCP only"
+		// doesn't matter here — only the outermost call's content decides
+		// CLAUDE.md's "запрос в llm не отправляем".
+		resolvedArgs, _ := expandMCPInstructions(ctx, rawArgs, registry, masker, stdout)
 		out := mcpRunToolCall(ctx, registry, server, name, resolvedArgs, masker, stdout)
 		return start + len(mcpInstrPrefix) + closeIdx + 1, out, true
 	}
@@ -234,7 +256,7 @@ func buildToolArguments(schema json.RawMessage, argsText string) (json.RawMessag
 
 	var raws []string
 	if argsText != "" {
-		raws = strings.Split(argsText, ",")
+		raws = splitTopLevelArgs(argsText)
 	}
 	if len(raws) > len(names) {
 		return nil, fmt.Errorf("передано %d аргументов, инструмент принимает %d", len(raws), len(names))
@@ -250,6 +272,38 @@ func buildToolArguments(schema json.RawMessage, argsText string) (json.RawMessag
 		obj[name] = val
 	}
 	return json.Marshal(obj)
+}
+
+// splitTopLevelArgs splits argsText on commas, except commas inside a
+// matching pair of single or double quotes — needed because a quoted
+// string argument (CLAUDE.md's "MCP:notes->add_note('{result}')", where
+// {result} is a previous LLM answer) can easily contain a literal comma
+// of its own, which a naive strings.Split(argsText, ",") would wrongly
+// treat as another argument.
+func splitTopLevelArgs(argsText string) []string {
+	var parts []string
+	var cur strings.Builder
+	var inQuote byte
+	for i := 0; i < len(argsText); i++ {
+		c := argsText[i]
+		switch {
+		case inQuote != 0:
+			cur.WriteByte(c)
+			if c == inQuote {
+				inQuote = 0
+			}
+		case c == '\'' || c == '"':
+			inQuote = c
+			cur.WriteByte(c)
+		case c == ',':
+			parts = append(parts, cur.String())
+			cur.Reset()
+		default:
+			cur.WriteByte(c)
+		}
+	}
+	parts = append(parts, cur.String())
+	return parts
 }
 
 // coerceArgument converts one positional argument's raw text into the Go

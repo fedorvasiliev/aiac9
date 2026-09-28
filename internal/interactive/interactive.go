@@ -231,13 +231,51 @@ func runDialog(ctx context.Context, cfg *config.Config, store *dialogstore.Store
 			continue
 		}
 
-		switch runTurn(ctx, cfg, store, masker, stdin, reader, stdout, opts, registry, dialogID, parentID, tmpl, promptFile, extra, &dialogContext, &dialogPromptTotal, &dialogCompletionTotal) {
-		case turnExit:
-			resultCh <- dialogResult{}
-			return
+		// CLAUDE.md's promptfile "Next Prompt" heading: once a turn
+		// produces a real result, if its template names another prompt
+		// file, that file is selected automatically — no fresh Step
+		// A/Step T — parsed, and run the same way, with "{result}" in its
+		// User prompt standing for this step's own result (runTurn
+		// substitutes it). Repeats until a template has no "Next Prompt",
+		// names a file that isn't there, or maxChainHops is hit (a cheap
+		// guard against two files naming each other and looping forever).
+		result := extra
+		previousResult := ""
+		for hops := 0; ; hops++ {
+			outcome, resultText := runTurn(ctx, cfg, store, masker, stdin, reader, stdout, opts, registry, dialogID, parentID, tmpl, promptFile, result, previousResult, &dialogContext, &dialogPromptTotal, &dialogCompletionTotal)
+			if outcome == turnExit {
+				resultCh <- dialogResult{}
+				return
+			}
+			if outcome != turnDone || resultText == "" || tmpl == nil {
+				break
+			}
+			nextFile, ok := tmpl.Value(promptfile.HeaderNextPrompt)
+			nextFile = strings.TrimSpace(nextFile)
+			if !ok || nextFile == "" {
+				break
+			}
+			if hops >= maxChainHops {
+				fmt.Fprintf(stdout, "Next Prompt: превышено число автопереходов (%d), останавливаюсь\n", maxChainHops)
+				break
+			}
+			nextTmpl, err := promptfile.Parse(filepath.Join(promptfile.Dir, nextFile))
+			if err != nil {
+				fmt.Fprintf(stdout, "Next Prompt %q не найден, продолжаем как обычно: %v\n", nextFile, err)
+				break
+			}
+			fmt.Fprintln(stdout, "автоматически перехожу к Next Prompt:", nextFile)
+			printPromptTable(stdout, nextTmpl)
+			saveAgentFields(store, nextTmpl, stdout)
+			tmpl, promptFile, result, previousResult = nextTmpl, nextFile, "", resultText
 		}
 	}
 }
+
+// maxChainHops bounds how many times "Next Prompt" can automatically
+// chain into another template in a row, so two files naming each other
+// can't loop forever.
+const maxChainHops = 20
 
 // runTurn drives one Step T submission through CLAUDE.md's "### State
 // Machine": planning → execution → validation → done, each phase printed
@@ -256,7 +294,7 @@ func runDialog(ctx context.Context, cfg *config.Config, store *dialogstore.Store
 // is idempotent; execution's result is never persisted mid-flight, so
 // resuming past planning always re-sends the request rather than
 // replaying a stored reply.
-func runTurn(ctx context.Context, cfg *config.Config, store *dialogstore.Store, masker *secretmask.Masker, stdin *os.File, reader *bufio.Reader, stdout io.Writer, opts Options, registry *mcp.Registry, dialogID, parentID string, tmpl *promptfile.Prompt, promptFile, extra string, dialogContext *string, dialogPromptTotal, dialogCompletionTotal *int) turnOutcome {
+func runTurn(ctx context.Context, cfg *config.Config, store *dialogstore.Store, masker *secretmask.Masker, stdin *os.File, reader *bufio.Reader, stdout io.Writer, opts Options, registry *mcp.Registry, dialogID, parentID string, tmpl *promptfile.Prompt, promptFile, extra, previousResult string, dialogContext *string, dialogPromptTotal, dialogCompletionTotal *int) (turnOutcome, string) {
 	stickyFacts := strings.EqualFold(cfg.ContextStrategy, config.ContextStrategyStickyFacts)
 
 	var turnMessages []llm.Message
@@ -275,6 +313,13 @@ func runTurn(ctx context.Context, cfg *config.Config, store *dialogstore.Store, 
 	// history twice. It's reset whenever execution reruns.
 	recorded := false
 
+	// skipLLM is CLAUDE.md's "## Работа с MCP": "Если в User prompt нет
+	// никаких инструкций (непустого текста) кроме MCP - выполняем их в
+	// полном объеме, но запрос в llm не отправляем" — set by planning,
+	// consulted right after it to jump straight to "done" instead of
+	// "execution".
+	var skipLLM bool
+
 	phase := phasePlanning
 	for {
 		switch phase {
@@ -286,17 +331,60 @@ func runTurn(ctx context.Context, cfg *config.Config, store *dialogstore.Store, 
 					planErr = errNothingToSend
 					return
 				}
+
+				// CLAUDE.md's promptfile "Next Prompt" heading: "{result}"
+				// in a chained prompt's User prompt is the previous step's
+				// answer — substituted before anything else touches the
+				// message, so it can itself be wrapped in a "MCP:..."
+				// instruction (CLAUDE.md's own example:
+				// "MCP:notes->add_note('{result}')").
+				if previousResult != "" {
+					for i := range turnMessages {
+						if turnMessages[i].Role == "user" {
+							turnMessages[i].Content = strings.ReplaceAll(turnMessages[i].Content, "{result}", previousResult)
+						}
+					}
+				}
+
 				// CLAUDE.md's "## Работа с MCP": a "MCP:<server>-><command>"
 				// instruction embedded in a user message is run locally,
 				// right here, and replaced with its result before the
 				// request is ever built — distinct from the model asking
 				// for a tool call at execution time (mcpTools/completeWithTools
-				// below).
+				// below). If every non-empty user message turns out to be
+				// nothing but such instructions, skipLLM below short-circuits
+				// straight to "done" instead of ever calling the model.
+				allMCPOnly := true
+				anyMCPOnly := false
 				for i := range turnMessages {
-					if turnMessages[i].Role == "user" {
-						turnMessages[i].Content = expandMCPInstructions(pctx, turnMessages[i].Content, registry, masker, stdout)
+					if turnMessages[i].Role != "user" {
+						continue
+					}
+					hadContent := strings.TrimSpace(turnMessages[i].Content) != ""
+					expanded, only := expandMCPInstructions(pctx, turnMessages[i].Content, registry, masker, stdout)
+					turnMessages[i].Content = expanded
+					if !hadContent {
+						continue
+					}
+					if only {
+						anyMCPOnly = true
+					} else {
+						allMCPOnly = false
 					}
 				}
+				skipLLM = allMCPOnly && anyMCPOnly
+				if skipLLM {
+					var parts []string
+					for _, m := range turnMessages {
+						if m.Role == "user" && strings.TrimSpace(m.Content) != "" {
+							parts = append(parts, m.Content)
+						}
+					}
+					content = strings.Join(parts, "\n")
+					ex = &llm.Exchange{Model: model}
+					return
+				}
+
 				client, planErr = resolveClient(model, cfg)
 				if planErr != nil {
 					return
@@ -332,7 +420,7 @@ func runTurn(ctx context.Context, cfg *config.Config, store *dialogstore.Store, 
 			})
 			if paused {
 				saveTaskState(store, dialogID, phasePlanning, promptFile, extra, stdout)
-				return turnPaused
+				return turnPaused, ""
 			}
 			if jump != "" {
 				phase = jump
@@ -340,9 +428,13 @@ func runTurn(ctx context.Context, cfg *config.Config, store *dialogstore.Store, 
 			}
 			if planErr != nil {
 				fmt.Fprintln(stdout, masker.Mask(planErr.Error()))
-				return turnDone
+				return turnDone, ""
 			}
-			phase = phaseExecution
+			if skipLLM {
+				phase = phaseDone
+			} else {
+				phase = phaseExecution
+			}
 
 		case phaseExecution:
 			var reqErr error
@@ -352,7 +444,7 @@ func runTurn(ctx context.Context, cfg *config.Config, store *dialogstore.Store, 
 			})
 			if paused {
 				saveTaskState(store, dialogID, phaseExecution, promptFile, extra, stdout)
-				return turnPaused
+				return turnPaused, ""
 			}
 			if jump != "" {
 				phase = jump
@@ -361,9 +453,9 @@ func runTurn(ctx context.Context, cfg *config.Config, store *dialogstore.Store, 
 			if reqErr != nil {
 				fmt.Fprintln(stdout, masker.Mask(reqErr.Error()))
 				if ctx.Err() != nil {
-					return turnExit
+					return turnExit, ""
 				}
-				return turnDone
+				return turnDone, ""
 			}
 			phase = phaseValidation
 
@@ -376,7 +468,7 @@ func runTurn(ctx context.Context, cfg *config.Config, store *dialogstore.Store, 
 			})
 			if paused {
 				saveTaskState(store, dialogID, phaseValidation, promptFile, extra, stdout)
-				return turnPaused
+				return turnPaused, ""
 			}
 			if jump != "" {
 				phase = jump
@@ -435,7 +527,7 @@ func runTurn(ctx context.Context, cfg *config.Config, store *dialogstore.Store, 
 				phase = jump
 				continue
 			}
-			return turnDone
+			return turnDone, content
 		}
 	}
 }

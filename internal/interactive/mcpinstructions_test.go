@@ -46,7 +46,7 @@ func calcSchema() []byte {
 func TestExpandMCPInstructions_NoInstructionLeavesContentUnchanged(t *testing.T) {
 	f := &fakeInline{}
 	var out bytes.Buffer
-	got := expandMCPInstructions(context.Background(), "just a plain prompt", f, secretmask.New(), &out)
+	got, _ := expandMCPInstructions(context.Background(), "just a plain prompt", f, secretmask.New(), &out)
 	if got != "just a plain prompt" {
 		t.Fatalf("got = %q, want unchanged", got)
 	}
@@ -63,7 +63,7 @@ func TestExpandMCPInstructions_ToolsListsNamesAndDescriptions(t *testing.T) {
 		},
 	}}
 	var out bytes.Buffer
-	got := expandMCPInstructions(context.Background(), "Подключись к mcp calc и выведи MCP:calc->tools", f, secretmask.New(), &out)
+	got, _ := expandMCPInstructions(context.Background(), "Подключись к mcp calc и выведи MCP:calc->tools", f, secretmask.New(), &out)
 	if got != "Подключись к mcp calc и выведи add: adds; subtract: subtracts" {
 		t.Fatalf("got = %q", got)
 	}
@@ -72,7 +72,7 @@ func TestExpandMCPInstructions_ToolsListsNamesAndDescriptions(t *testing.T) {
 func TestExpandMCPInstructions_ToolsUnknownServerIsAnInlineError(t *testing.T) {
 	f := &fakeInline{}
 	var out bytes.Buffer
-	got := expandMCPInstructions(context.Background(), "MCP:ghost->tools", f, secretmask.New(), &out)
+	got, _ := expandMCPInstructions(context.Background(), "MCP:ghost->tools", f, secretmask.New(), &out)
 	if !strings.Contains(got, "MCP ошибка") || !strings.Contains(got, "ghost") {
 		t.Fatalf("got = %q, want an inline error mentioning the unknown server", got)
 	}
@@ -88,7 +88,7 @@ func TestExpandMCPInstructions_CallWithPositionalNumericArgs(t *testing.T) {
 		}{"calc__add": {text: "13"}},
 	}
 	var out bytes.Buffer
-	got := expandMCPInstructions(context.Background(), "Посчитай MCP:calc->add(4, 9) и объясни", f, secretmask.New(), &out)
+	got, _ := expandMCPInstructions(context.Background(), "Посчитай MCP:calc->add(4, 9) и объясни", f, secretmask.New(), &out)
 	if got != "Посчитай 13 и объясни" {
 		t.Fatalf("got = %q", got)
 	}
@@ -100,7 +100,7 @@ func TestExpandMCPInstructions_CallWithPositionalNumericArgs(t *testing.T) {
 func TestExpandMCPInstructions_CallUnknownToolIsAnInlineError(t *testing.T) {
 	f := &fakeInline{tools: map[string][]mcp.RegisteredTool{"calc": {{Name: "calc__add", InputSchema: calcSchema()}}}}
 	var out bytes.Buffer
-	got := expandMCPInstructions(context.Background(), "MCP:calc->nope(1)", f, secretmask.New(), &out)
+	got, _ := expandMCPInstructions(context.Background(), "MCP:calc->nope(1)", f, secretmask.New(), &out)
 	if !strings.Contains(got, "MCP ошибка") || !strings.Contains(got, "nope") {
 		t.Fatalf("got = %q, want an inline error mentioning the unknown tool", got)
 	}
@@ -116,7 +116,7 @@ func TestExpandMCPInstructions_ToolLevelErrorIsInlinedToo(t *testing.T) {
 		}{"calc__divide": {text: "division by zero", isError: true}},
 	}
 	var out bytes.Buffer
-	got := expandMCPInstructions(context.Background(), "MCP:calc->divide(1, 0)", f, secretmask.New(), &out)
+	got, _ := expandMCPInstructions(context.Background(), "MCP:calc->divide(1, 0)", f, secretmask.New(), &out)
 	if !strings.Contains(got, "MCP ошибка") || !strings.Contains(got, "division by zero") {
 		t.Fatalf("got = %q, want the tool's error text inlined", got)
 	}
@@ -132,7 +132,7 @@ func TestExpandMCPInstructions_NoArgsToolCall(t *testing.T) {
 		}{"notes__list_notes": {text: "(empty)"}},
 	}
 	var out bytes.Buffer
-	got := expandMCPInstructions(context.Background(), "MCP:notes->list_notes()", f, secretmask.New(), &out)
+	got, _ := expandMCPInstructions(context.Background(), "MCP:notes->list_notes()", f, secretmask.New(), &out)
 	if got != "(empty)" {
 		t.Fatalf("got = %q", got)
 	}
@@ -184,7 +184,7 @@ func TestExpandMCPInstructions_NestedCallResolvesInnermostFirst(t *testing.T) {
 		},
 	}
 	var out bytes.Buffer
-	got := expandMCPInstructions(context.Background(), "Результат: MCP:calc->add(MCP:calc->multiply(2, 3), 9)", f, secretmask.New(), &out)
+	got, _ := expandMCPInstructions(context.Background(), "Результат: MCP:calc->add(MCP:calc->multiply(2, 3), 9)", f, secretmask.New(), &out)
 	if got != "Результат: 15" {
 		t.Fatalf("got = %q, want the outer call's own result", got)
 	}
@@ -213,7 +213,7 @@ func TestExpandMCPInstructions_ThreeLevelsDeep(t *testing.T) {
 		},
 	}
 	var out bytes.Buffer
-	got := expandMCPInstructions(context.Background(), "MCP:calc->add(MCP:calc->subtract(MCP:calc->multiply(2, 3), 5), 9)", f, secretmask.New(), &out)
+	got, _ := expandMCPInstructions(context.Background(), "MCP:calc->add(MCP:calc->subtract(MCP:calc->multiply(2, 3), 5), 9)", f, secretmask.New(), &out)
 	if got != "10" {
 		t.Fatalf("got = %q", got)
 	}
@@ -244,7 +244,7 @@ func TestExpandMCPInstructions_NestedAcrossDifferentServers(t *testing.T) {
 		},
 	}
 	var out bytes.Buffer
-	got := expandMCPInstructions(context.Background(), "MCP:calc->add(MCP:notes->count(), 10)", f, secretmask.New(), &out)
+	got, _ := expandMCPInstructions(context.Background(), "MCP:calc->add(MCP:notes->count(), 10)", f, secretmask.New(), &out)
 	if got != "13" {
 		t.Fatalf("got = %q", got)
 	}
@@ -256,12 +256,108 @@ func TestExpandMCPInstructions_NestedAcrossDifferentServers(t *testing.T) {
 func TestExpandMCPInstructions_UnbalancedParensIsLeftUnexpanded(t *testing.T) {
 	f := &fakeInline{tools: map[string][]mcp.RegisteredTool{"calc": {{Name: "calc__add", InputSchema: calcSchema()}}}}
 	var out bytes.Buffer
-	got := expandMCPInstructions(context.Background(), "MCP:calc->add(1, 2", f, secretmask.New(), &out)
+	got, _ := expandMCPInstructions(context.Background(), "MCP:calc->add(1, 2", f, secretmask.New(), &out)
 	if got != "MCP:calc->add(1, 2" {
 		t.Fatalf("got = %q, want the malformed instruction left untouched", got)
 	}
 	if len(f.calls) != 0 {
 		t.Fatalf("calls = %+v, want none for an unbalanced call", f.calls)
+	}
+}
+
+func TestExpandMCPInstructions_MCPOnlyContentReportsTrue(t *testing.T) {
+	// CLAUDE.md: "Если в User prompt нет никаких инструкций (непустого
+	// текста) кроме MCP - выполняем их в полном объеме, но запрос в llm не
+	// отправляем" — a message that's nothing but one MCP call (whitespace
+	// around it doesn't count as "other text").
+	f := &fakeInline{
+		tools: map[string][]mcp.RegisteredTool{"notes": {{Name: "notes__list_notes", InputSchema: []byte(`{"type":"object","properties":{}}`)}}},
+		callResult: callResultMap{
+			"notes__list_notes": {text: "no notes yet"},
+		},
+	}
+	var out bytes.Buffer
+	got, mcpOnly := expandMCPInstructions(context.Background(), "  MCP:notes->list_notes()  \n", f, secretmask.New(), &out)
+	if !mcpOnly {
+		t.Fatal("mcpOnly = false, want true for a message that's nothing but one MCP call")
+	}
+	if got != "  no notes yet  \n" {
+		t.Fatalf("got = %q", got)
+	}
+}
+
+func TestExpandMCPInstructions_TextAlongsideMCPIsNotMCPOnly(t *testing.T) {
+	f := &fakeInline{tools: map[string][]mcp.RegisteredTool{"calc": {{Name: "calc__add", InputSchema: calcSchema()}}}}
+	var out bytes.Buffer
+	_, mcpOnly := expandMCPInstructions(context.Background(), "Посчитай MCP:calc->add(4, 9) и объясни", f, secretmask.New(), &out)
+	if mcpOnly {
+		t.Fatal("mcpOnly = true, want false when real surrounding text is present")
+	}
+}
+
+func TestExpandMCPInstructions_NoInstructionIsNotMCPOnly(t *testing.T) {
+	f := &fakeInline{}
+	var out bytes.Buffer
+	_, mcpOnly := expandMCPInstructions(context.Background(), "just a plain prompt", f, secretmask.New(), &out)
+	if mcpOnly {
+		t.Fatal("mcpOnly = true, want false when there's no MCP instruction at all")
+	}
+}
+
+func TestExpandMCPInstructions_MultipleMCPCallsWithOnlyWhitespaceBetweenAreMCPOnly(t *testing.T) {
+	f := &fakeInline{
+		tools: map[string][]mcp.RegisteredTool{"calc": {{Name: "calc__add", InputSchema: calcSchema()}}},
+		callResult: callResultMap{
+			"calc__add": {text: "13"},
+		},
+	}
+	var out bytes.Buffer
+	_, mcpOnly := expandMCPInstructions(context.Background(), "MCP:calc->add(4, 9)\nMCP:calc->add(1, 2)", f, secretmask.New(), &out)
+	if !mcpOnly {
+		t.Fatal("mcpOnly = false, want true — nothing but whitespace between two MCP calls")
+	}
+}
+
+func TestExpandMCPInstructions_UnrecognizedMCPPrefixIsNotMCPOnly(t *testing.T) {
+	f := &fakeInline{}
+	var out bytes.Buffer
+	_, mcpOnly := expandMCPInstructions(context.Background(), "MCP:scheduler->get_summary", f, secretmask.New(), &out)
+	if mcpOnly {
+		t.Fatal("mcpOnly = true, want false — a bare command with no parens never actually ran")
+	}
+}
+
+func TestSplitTopLevelArgs_CommaInsideQuotesIsNotASeparator(t *testing.T) {
+	got := splitTopLevelArgs(`'hello, world', 42`)
+	if len(got) != 2 {
+		t.Fatalf("got = %+v, want 2 parts", got)
+	}
+	if got[0] != `'hello, world'` {
+		t.Fatalf("got[0] = %q, want the quoted string kept whole", got[0])
+	}
+	if strings.TrimSpace(got[1]) != "42" {
+		t.Fatalf("got[1] = %q, want 42", got[1])
+	}
+}
+
+func TestExpandMCPInstructions_ResultWithACommaDoesNotBreakArgumentCount(t *testing.T) {
+	// Mirrors CLAUDE.md's own example, "MCP:notes->add_note('{result}')",
+	// once {result} has already been substituted with a previous LLM
+	// answer that happens to contain a comma — buildToolArguments must not
+	// mistake it for a second argument.
+	f := &fakeInline{tools: map[string][]mcp.RegisteredTool{"notes": {
+		{Name: "notes__add_note", InputSchema: []byte(`{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}`)},
+	}}}
+	var out bytes.Buffer
+	got, mcpOnly := expandMCPInstructions(context.Background(), "MCP:notes->add_note('9 is odd, prime-adjacent, and a perfect square')", f, secretmask.New(), &out)
+	if !mcpOnly {
+		t.Fatal("mcpOnly = false, want true")
+	}
+	if len(f.calls) != 1 {
+		t.Fatalf("calls = %+v, want exactly 1 (the comma inside quotes must not split into a second call)", f.calls)
+	}
+	if got == "" {
+		t.Fatal("got is empty")
 	}
 }
 
@@ -272,7 +368,7 @@ func TestExpandMCPInstructions_BareCommandWithoutParensIsNotACall(t *testing.T) 
 	// even for a zero-argument tool ("notes->list_notes()").
 	f := &fakeInline{tools: map[string][]mcp.RegisteredTool{"scheduler": {{Name: "scheduler__get_summary"}}}}
 	var out bytes.Buffer
-	got := expandMCPInstructions(context.Background(), "MCP:scheduler->get_summary", f, secretmask.New(), &out)
+	got, _ := expandMCPInstructions(context.Background(), "MCP:scheduler->get_summary", f, secretmask.New(), &out)
 	if got != "MCP:scheduler->get_summary" {
 		t.Fatalf("got = %q, want it left unchanged", got)
 	}
